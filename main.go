@@ -34,7 +34,7 @@ func main() {
 	// Get database URL from environment variable or fallback
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		dbURL = "postgres://postgres:postgres@localhost:5432/jobqueue?sslmode=disable"
+		dbURL = "postgres://postgres:%23Asish%401199198@localhost:5432/jobqueue?sslmode=disable"
 	}
 
 	log.Printf("\033[1;34m[System] Connecting to database...\033[0m")
@@ -65,16 +65,16 @@ func main() {
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 
-	// Enqueue 15 initial jobs
-	log.Printf("\033[1;32m[Producer] Enqueueing 15 persistent jobs...\033[0m")
-	for i := 1; i <= 15; i++ {
+	// Enqueue 50 initial jobs
+	log.Printf("\033[1;32m[Producer] Enqueueing 50 persistent jobs...\033[0m")
+	for i := 1; i <= 50; i++ {
 		jobID := fmt.Sprintf("job-%d", i)
 		payload := fmt.Sprintf("Payload info for task %d", i)
 		if err := enqueueJob(runCtx, db, jobID, payload); err != nil {
 			log.Fatalf("\033[1;31m[Producer] Failed to enqueue job %s: %v\033[0m", jobID, err)
 		}
 	}
-	log.Printf("\033[1;32m[Producer] Enqueued 15 jobs successfully.\033[0m")
+	log.Printf("\033[1;32m[Producer] Enqueued 50 jobs successfully.\033[0m")
 
 	// Start 3 worker goroutines
 	numWorkers := 3
