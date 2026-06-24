@@ -101,8 +101,8 @@ func worker(ctx context.Context, id int, rdb *redis.Client, wg *sync.WaitGroup) 
 			return
 		default:
 			// Pop a job from Redis. BRPop is blocking with a timeout.
-			// We use a short timeout (e.g., 1 second) to allow check of ctx.Done() frequently.
-			res, err := rdb.BRPop(ctx, 1*time.Second, queueKey).Result()
+			// We use a 15-second timeout to reduce connection polling and save Upstash quota.
+			res, err := rdb.BRPop(ctx, 15*time.Second, queueKey).Result()
 			if err != nil {
 				if errors.Is(err, redis.Nil) {
 					// Timeout with no jobs popped, loop again
