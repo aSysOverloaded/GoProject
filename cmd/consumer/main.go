@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -24,6 +25,11 @@ type Job struct {
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
+
+	// Load .env file if it exists
+	if err := godotenv.Load(); err != nil {
+		log.Println("\033[1;30m[System] No .env file found, using system environment variables\033[0m")
+	}
 
 	fmt.Println("\033[1;35m==================================================\033[0m")
 	fmt.Println("\033[1;35m      🚀 Distributed Job Queue - Consumer (M3)     \033[0m")

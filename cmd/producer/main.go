@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -18,6 +19,11 @@ type Job struct {
 }
 
 func main() {
+	// Load .env file if it exists
+	if err := godotenv.Load(); err != nil {
+		log.Println("\033[1;30m[System] No .env file found, using system environment variables\033[0m")
+	}
+
 	fmt.Println("\033[1;35m==================================================\033[0m")
 	fmt.Println("\033[1;35m      🚀 Distributed Job Queue - Producer (M3)     \033[0m")
 	fmt.Println("\033[1;35m==================================================\033[0m")
