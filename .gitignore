@@ -21,3 +21,9 @@ go.work.sum
 
 # Environment Variables
 .env
+
+# Separate projects living in this folder
+MarketingAgent/
+
+# Locally generated files
+interview_prep.md
