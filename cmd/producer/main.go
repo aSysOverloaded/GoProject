@@ -53,7 +53,7 @@ func main() {
 	log.Printf("\033[1;32m[System] Connected to Redis successfully.\033[0m")
 
 	queueKey := "jobs:queue"
-	numJobs := 10
+	numJobs := 100
 
 	log.Printf("\033[1;32m[Producer] Enqueueing %d persistent jobs into Redis list '%s'...\033[0m", numJobs, queueKey)
 	for i := 1; i <= numJobs; i++ {
