@@ -32,7 +32,7 @@ func main() {
 	}
 
 	fmt.Println("\033[1;35m==================================================\033[0m")
-	fmt.Println("\033[1;35m      🚀 Distributed Job Queue - Consumer (M3)     \033[0m")
+	fmt.Println("\033[1;35m      🚀 Distributed Job Queue - Consumer (M5)     \033[0m")
 	fmt.Println("\033[1;35m==================================================\033[0m")
 
 	redisURL := os.Getenv("REDIS_URL")
@@ -93,11 +93,34 @@ func main() {
 }
 
 const (
-	queueKey      = "jobs:queue"
-	processingKey = "jobs:processing"
-	dlqKey        = "jobs:dlq"
-	visTimeout    = 5 * time.Second // Visibility timeout
+	queueKey     = "jobs:queue"
+	inflightKey  = "jobs:inflight"
+	deadlinesKey = "jobs:deadlines"
+	dlqKey       = "jobs:dlq"
+
+	maxAttempts = 3
 )
+
+// Timings live in vars rather than consts so the tests can compress them.
+var (
+	// visTimeout is how long a job may stay in-flight without a heartbeat
+	// before the sweeper treats its owner as dead.
+	visTimeout = 15 * time.Second
+	// heartbeatTick must be comfortably shorter than visTimeout so a healthy
+	// worker always refreshes its claim before the sweeper can expire it.
+	heartbeatTick = 5 * time.Second
+	sweepTick     = 3 * time.Second
+	// blockTimeout is how long BLMOVE parks on an empty queue. Longer means
+	// fewer commands billed against Upstash while idle.
+	blockTimeout = 15 * time.Second
+)
+
+// deadlineFrom returns the ZSET score for a claim made now. Scores are
+// milliseconds since the epoch: whole seconds were too coarse to express a
+// visibility timeout accurately.
+func deadlineFrom(t time.Time) float64 {
+	return float64(t.Add(visTimeout).UnixMilli())
+}
 
 func worker(ctx context.Context, id int, rdb *redis.Client, wg *sync.WaitGroup) {
 	defer wg.Done()
@@ -109,89 +132,170 @@ func worker(ctx context.Context, id int, rdb *redis.Client, wg *sync.WaitGroup) 
 			log.Printf("\033[33m[Worker %d] Stopped.\033[0m", id)
 			return
 		default:
-			// Pop a job from Redis. BRPop is blocking with a timeout.
-			// We use a 5-second timeout to balance responsiveness with saving Upstash quota.
-			res, err := rdb.BRPop(ctx, 5*time.Second, queueKey).Result()
-			if err != nil {
-				if errors.Is(err, redis.Nil) {
-					continue
-				}
-				if errors.Is(err, context.Canceled) {
-					continue
-				}
-				log.Printf("\033[31m[Worker %d] Error popping from Redis: %v\033[0m", id, err)
-				time.Sleep(1 * time.Second)
+		}
+
+		// BLMOVE pops from the queue AND records the job in the in-flight list
+		// as a single atomic step. This is the reason we no longer use BRPOP:
+		// with BRPOP a crash in the window between the pop and the bookkeeping
+		// write destroyed the job, because nothing on the server side still
+		// referenced it. Now every in-flight job is reachable from jobs:inflight
+		// no matter when we die.
+		jobJSON, err := rdb.BLMove(ctx, queueKey, inflightKey, "RIGHT", "LEFT", blockTimeout).Result()
+		if err != nil {
+			if errors.Is(err, redis.Nil) || errors.Is(err, context.Canceled) {
 				continue
 			}
+			log.Printf("\033[31m[Worker %d] Error popping from Redis: %v\033[0m", id, err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
 
-			jobJSON := res[1]
-			var job Job
-			if err := json.Unmarshal([]byte(jobJSON), &job); err != nil {
-				log.Printf("\033[31m[Worker %d] Error parsing job JSON: %v\033[0m", id, err)
-				continue
-			}
+		handleJob(id, rdb, jobJSON)
+	}
+}
 
-			// 1. Acquire Visibility Lock: Add to processing ZSET with score = now + visibility timeout
-			expireAt := time.Now().Add(visTimeout).Unix()
-			err = rdb.ZAdd(ctx, processingKey, redis.Z{
-				Score:  float64(expireAt),
+// handleJob owns one job end to end: claim it, keep the claim alive while we
+// work, then settle the outcome.
+func handleJob(workerID int, rdb *redis.Client, jobJSON string) {
+	var job Job
+	if err := json.Unmarshal([]byte(jobJSON), &job); err != nil {
+		log.Printf("\033[31m[Worker %d] Error parsing job JSON: %v\033[0m", workerID, err)
+		// Drop the unparseable payload out of the in-flight list, otherwise the
+		// sweeper would rediscover it forever.
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		rdb.LRem(dropCtx, inflightKey, 1, jobJSON)
+		rdb.ZRem(dropCtx, deadlinesKey, jobJSON)
+		dropCancel()
+		return
+	}
+
+	log.Printf("\033[34m[Worker %d] ➡️ Processing Job %s - Attempt %d/%d\033[0m", workerID, job.ID, job.Attempts+1, maxAttempts)
+
+	claimCtx, claimCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	err := rdb.ZAdd(claimCtx, deadlinesKey, redis.Z{
+		Score:  deadlineFrom(time.Now()),
+		Member: jobJSON,
+	}).Err()
+	claimCancel()
+	if err != nil {
+		log.Printf("\033[31m[Worker %d] Error claiming job %s: %v\033[0m", workerID, job.ID, err)
+	}
+
+	// Keep the claim fresh for as long as we are genuinely alive, so that a
+	// slow-but-healthy worker is never mistaken for a crashed one.
+	hbCtx, stopHeartbeat := context.WithCancel(context.Background())
+	go heartbeat(hbCtx, workerID, rdb, job.ID, jobJSON)
+
+	success, workDuration := processJob(job)
+
+	stopHeartbeat()
+	settle(workerID, rdb, job, jobJSON, success, workDuration)
+}
+
+// heartbeat pushes the job's deadline further out at a steady tick. It only
+// ever fires for jobs that outlive heartbeatTick, so in normal operation it
+// costs zero extra Redis commands.
+func heartbeat(ctx context.Context, workerID int, rdb *redis.Client, jobID, jobJSON string) {
+	ticker := time.NewTicker(heartbeatTick)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// XX: only extend a claim we still hold. If the sweeper already
+			// reclaimed this job, ZADD XX is a no-op rather than resurrecting
+			// a deadline for a job somebody else now owns.
+			hbCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			err := rdb.ZAddXX(hbCtx, deadlinesKey, redis.Z{
+				Score:  deadlineFrom(time.Now()),
 				Member: jobJSON,
 			}).Err()
+			cancel()
 			if err != nil {
-				log.Printf("\033[31m[Worker %d] Error locking job %s in ZSET: %v\033[0m", id, job.ID, err)
-				continue
+				log.Printf("\033[31m[Worker %d] Heartbeat failed for Job %s: %v\033[0m", workerID, jobID, err)
 			}
-
-			// Process the job
-			processJob(id, rdb, job, jobJSON)
 		}
 	}
 }
 
-func processJob(workerID int, rdb *redis.Client, job Job, jobJSON string) {
-	log.Printf("\033[34m[Worker %d] ➡️ Processing Job %s - Attempt %d/3\033[0m", workerID, job.ID, job.Attempts+1)
-
+// processJob is the pure "do the work" step: no Redis, no bookkeeping.
+func processJob(job Job) (success bool, workDuration time.Duration) {
 	// Simulate work duration: random between 200ms and 800ms
-	workDuration := time.Duration(200+rand.Intn(600)) * time.Millisecond
+	workDuration = time.Duration(200+rand.Intn(600)) * time.Millisecond
 	time.Sleep(workDuration)
 
-	dbCtx, dbCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer dbCancel()
-
 	// Simulate 30% failure rate
-	if rand.Float32() < 0.3 {
-		job.Attempts++
-		log.Printf("\033[31m[Worker %d] ❌ Job %s FAILED (Attempt %d/3)\033[0m", workerID, job.ID, job.Attempts)
+	return rand.Float32() >= 0.3, workDuration
+}
 
-		// Remove from processing ZSET (release lock)
-		rdb.ZRem(dbCtx, processingKey, jobJSON)
+// settle records the outcome of a job the worker just finished.
+func settle(workerID int, rdb *redis.Client, job Job, jobJSON string, success bool, workDuration time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
-		if job.Attempts < 3 {
-			log.Printf("\033[35m[Worker %d] 🔁 Requeueing Job %s...\033[0m", workerID, job.ID)
-			newJobJSON, _ := json.Marshal(job)
-			if err := rdb.LPush(dbCtx, queueKey, newJobJSON).Err(); err != nil {
-				log.Printf("\033[31m[Worker %d] Error requeueing job %s: %v\033[0m", workerID, job.ID, err)
-			}
-		} else {
-			log.Printf("\033[1;31m[Worker %d] 💀 Job %s failed permanently after 3 attempts. Sending to DLQ.\033[0m", workerID, job.ID)
-			newJobJSON, _ := json.Marshal(job)
-			if err := rdb.LPush(dbCtx, dlqKey, newJobJSON).Err(); err != nil {
-				log.Printf("\033[31m[Worker %d] Error sending job %s to DLQ: %v\033[0m", workerID, job.ID, err)
-			}
-		}
-	} else {
+	// ZREM is the ownership handshake. Exactly one of {this worker, the sweeper}
+	// can get 1 back for a given job. Getting 0 means the sweeper decided we
+	// were dead and already requeued the job, so our result is stale and we
+	// must drop it - requeueing here is what used to duplicate the job and
+	// inflate its attempt counter.
+	owned, err := rdb.ZRem(ctx, deadlinesKey, jobJSON).Result()
+	if err != nil {
+		log.Printf("\033[31m[Worker %d] Error releasing Job %s: %v\033[0m", workerID, job.ID, err)
+		return
+	}
+	if owned == 0 {
+		log.Printf("\033[1;33m[Worker %d] ⚠️ Job %s was reclaimed by the sweeper mid-flight. Discarding result.\033[0m", workerID, job.ID)
+		return
+	}
+
+	if err := rdb.LRem(ctx, inflightKey, 1, jobJSON).Err(); err != nil {
+		log.Printf("\033[31m[Worker %d] Error clearing Job %s from in-flight list: %v\033[0m", workerID, job.ID, err)
+	}
+
+	if success {
 		log.Printf("\033[32m[Worker %d] ✅ Job %s completed successfully in %v\033[0m", workerID, job.ID, workDuration)
-		// Success: Remove from processing ZSET
-		rdb.ZRem(dbCtx, processingKey, jobJSON)
+		return
+	}
+
+	job.Attempts++
+	log.Printf("\033[31m[Worker %d] ❌ Job %s FAILED (Attempt %d/%d)\033[0m", workerID, job.ID, job.Attempts, maxAttempts)
+	retryOrBury(ctx, rdb, fmt.Sprintf("Worker %d", workerID), job)
+}
+
+// retryOrBury pushes a failed job back onto the queue, or into the DLQ once it
+// has burned through its attempts. Shared by the worker and the sweeper so both
+// paths apply the same retry policy.
+func retryOrBury(ctx context.Context, rdb *redis.Client, actor string, job Job) {
+	jobJSON, err := json.Marshal(job)
+	if err != nil {
+		log.Printf("\033[31m[%s] Error marshalling Job %s: %v\033[0m", actor, job.ID, err)
+		return
+	}
+
+	if job.Attempts < maxAttempts {
+		log.Printf("\033[35m[%s] 🔁 Requeueing Job %s (Attempt %d/%d)...\033[0m", actor, job.ID, job.Attempts, maxAttempts)
+		if err := rdb.LPush(ctx, queueKey, jobJSON).Err(); err != nil {
+			log.Printf("\033[31m[%s] Error requeueing job %s: %v\033[0m", actor, job.ID, err)
+		}
+		return
+	}
+
+	log.Printf("\033[1;31m[%s] 💀 Job %s failed permanently after %d attempts. Sending to DLQ.\033[0m", actor, job.ID, maxAttempts)
+	if err := rdb.LPush(ctx, dlqKey, jobJSON).Err(); err != nil {
+		log.Printf("\033[31m[%s] Error sending job %s to DLQ: %v\033[0m", actor, job.ID, err)
 	}
 }
 
-// sweeper periodically checks for orphaned/timed-out jobs in the processing ZSET
+// sweeper looks for jobs stranded in the in-flight list by a crashed worker.
+// The in-flight list is the source of truth for "what is being worked on"; the
+// deadlines ZSET only answers "is its owner still alive".
 func sweeper(ctx context.Context, rdb *redis.Client, wg *sync.WaitGroup) {
 	defer wg.Done()
 	log.Printf("\033[1;30m[Sweeper] Active and monitoring for orphaned jobs...\033[0m")
 
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(sweepTick)
 	defer ticker.Stop()
 
 	for {
@@ -200,56 +304,83 @@ func sweeper(ctx context.Context, rdb *redis.Client, wg *sync.WaitGroup) {
 			log.Printf("\033[1;30m[Sweeper] Stopped.\033[0m")
 			return
 		case <-ticker.C:
-			now := time.Now().Unix()
-			
-			// Find all jobs whose visibility timeout has expired (score <= now)
-			expiredJobs, err := rdb.ZRangeByScore(ctx, processingKey, &redis.ZRangeBy{
-				Min: "-inf",
-				Max: fmt.Sprintf("%d", now),
-			}).Result()
+			inflight, err := rdb.LRange(ctx, inflightKey, 0, -1).Result()
 			if err != nil {
 				if !errors.Is(err, context.Canceled) {
-					log.Printf("\033[31m[Sweeper] Error fetching expired jobs: %v\033[0m", err)
+					log.Printf("\033[31m[Sweeper] Error reading in-flight list: %v\033[0m", err)
+				}
+				continue
+			}
+			if len(inflight) == 0 {
+				continue
+			}
+
+			// One round trip for all deadlines instead of one per job.
+			pipe := rdb.Pipeline()
+			scores := make([]*redis.FloatCmd, len(inflight))
+			for i, jobJSON := range inflight {
+				scores[i] = pipe.ZScore(ctx, deadlinesKey, jobJSON)
+			}
+			if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+				if !errors.Is(err, context.Canceled) {
+					log.Printf("\033[31m[Sweeper] Error fetching deadlines: %v\033[0m", err)
 				}
 				continue
 			}
 
-			for _, jobJSON := range expiredJobs {
-				// Atomically attempt to remove the job from ZSET to claim ownership
-				// ZREM returns the number of members removed. If 1, we successfully locked it.
-				removed, err := rdb.ZRem(ctx, processingKey, jobJSON).Result()
+			now := float64(time.Now().UnixMilli())
+			for i, jobJSON := range inflight {
+				deadline, err := scores[i].Result()
+
+				if errors.Is(err, redis.Nil) {
+					// In-flight but with no deadline at all: its owner died in
+					// the narrow window between BLMOVE and the claiming ZADD.
+					// Give it a deadline rather than reclaiming immediately -
+					// NX so we never stomp a worker that is merely a
+					// millisecond slow to register its own claim. If nobody
+					// heartbeats it, a later sweep reclaims it normally.
+					rdb.ZAddNX(ctx, deadlinesKey, redis.Z{
+						Score:  deadlineFrom(time.Now()),
+						Member: jobJSON,
+					})
+					continue
+				}
 				if err != nil {
 					continue
 				}
-				if removed == 0 {
-					// Another consumer's sweeper already reclaimed this job
+				if deadline > now {
+					// Owner is alive and heartbeating.
 					continue
 				}
 
-				var job Job
-				if err := json.Unmarshal([]byte(jobJSON), &job); err != nil {
-					continue
-				}
-
-				job.Attempts++
-				log.Printf("\033[1;33m[Sweeper] ⚠️ Detected orphaned Job %s (Worker crashed). Reclaiming...\033[0m", job.ID)
-
-				dbCtx, dbCancel := context.WithTimeout(context.Background(), 2*time.Second)
-				if job.Attempts < 3 {
-					log.Printf("\033[1;35m[Sweeper] 🔁 Requeueing Job %s (Attempt %d/3)\033[0m", job.ID, job.Attempts)
-					newJobJSON, _ := json.Marshal(job)
-					if err := rdb.LPush(dbCtx, queueKey, newJobJSON).Err(); err != nil {
-						log.Printf("\033[31m[Sweeper] Error requeueing Job %s: %v\033[0m", job.ID, err)
-					}
-				} else {
-					log.Printf("\033[1;31m[Sweeper] 💀 Job %s exceeded max attempts after crash. Sending to DLQ.\033[0m", job.ID)
-					newJobJSON, _ := json.Marshal(job)
-					if err := rdb.LPush(dbCtx, dlqKey, newJobJSON).Err(); err != nil {
-						log.Printf("\033[31m[Sweeper] Error sending Job %s to DLQ: %v\033[0m", job.ID, err)
-					}
-				}
-				dbCancel()
+				reclaim(ctx, rdb, jobJSON)
 			}
 		}
 	}
+}
+
+// reclaim takes ownership of an expired job and applies the retry policy.
+func reclaim(ctx context.Context, rdb *redis.Client, jobJSON string) {
+	// Same ownership handshake as settle: ZREM returning 1 means we won the
+	// race against the job's original worker and any other consumer's sweeper.
+	removed, err := rdb.ZRem(ctx, deadlinesKey, jobJSON).Result()
+	if err != nil || removed == 0 {
+		return
+	}
+
+	if err := rdb.LRem(ctx, inflightKey, 1, jobJSON).Err(); err != nil {
+		log.Printf("\033[31m[Sweeper] Error clearing reclaimed job from in-flight list: %v\033[0m", err)
+	}
+
+	var job Job
+	if err := json.Unmarshal([]byte(jobJSON), &job); err != nil {
+		return
+	}
+
+	job.Attempts++
+	log.Printf("\033[1;33m[Sweeper] ⚠️ Detected orphaned Job %s (Worker crashed). Reclaiming...\033[0m", job.ID)
+
+	dbCtx, dbCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer dbCancel()
+	retryOrBury(dbCtx, rdb, "Sweeper", job)
 }
