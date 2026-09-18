@@ -63,6 +63,15 @@ func main() {
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 
+	metricsAddr := os.Getenv("METRICS_ADDR")
+	if metricsAddr == "" {
+		metricsAddr = ":2112"
+	}
+	metricsSrv := serveMetrics(metricsAddr)
+
+	wg.Add(1)
+	go pollQueueDepths(runCtx, rdb, &wg)
+
 	numWorkers := 3
 	log.Printf("\033[1;34m[System] Starting %d workers...\033[0m", numWorkers)
 	for i := 1; i <= numWorkers; i++ {
@@ -88,6 +97,14 @@ func main() {
 	// Wait for workers and sweeper to finish
 	log.Printf("\033[1;33m[System] Waiting for workers and sweeper to complete...\033[0m")
 	wg.Wait()
+
+	// Stop serving metrics last, so a final scrape can still catch the
+	// counters from the jobs we just drained.
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelShutdown()
+	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("\033[31m[Metrics] Error during shutdown: %v\033[0m", err)
+	}
 
 	log.Printf("\033[1;32m[System] Shutdown complete.\033[0m")
 }
@@ -246,6 +263,7 @@ func settle(workerID int, rdb *redis.Client, job Job, jobJSON string, success bo
 		return
 	}
 	if owned == 0 {
+		staleResults.Inc()
 		log.Printf("\033[1;33m[Worker %d] ⚠️ Job %s was reclaimed by the sweeper mid-flight. Discarding result.\033[0m", workerID, job.ID)
 		return
 	}
@@ -254,38 +272,53 @@ func settle(workerID int, rdb *redis.Client, job Job, jobJSON string, success bo
 		log.Printf("\033[31m[Worker %d] Error clearing Job %s from in-flight list: %v\033[0m", workerID, job.ID, err)
 	}
 
+	jobDuration.Observe(workDuration.Seconds())
+
 	if success {
+		jobsProcessed.WithLabelValues("success").Inc()
 		log.Printf("\033[32m[Worker %d] ✅ Job %s completed successfully in %v\033[0m", workerID, job.ID, workDuration)
 		return
 	}
 
+	jobsProcessed.WithLabelValues("failure").Inc()
 	job.Attempts++
 	log.Printf("\033[31m[Worker %d] ❌ Job %s FAILED (Attempt %d/%d)\033[0m", workerID, job.ID, job.Attempts, maxAttempts)
-	retryOrBury(ctx, rdb, fmt.Sprintf("Worker %d", workerID), job)
+	retryOrBury(ctx, rdb, actor{label: "worker", name: fmt.Sprintf("Worker %d", workerID)}, job)
+}
+
+// actor identifies who is applying the retry policy: name is for humans
+// reading the log, label is the low-cardinality value used on metrics.
+type actor struct {
+	label string
+	name  string
 }
 
 // retryOrBury pushes a failed job back onto the queue, or into the DLQ once it
 // has burned through its attempts. Shared by the worker and the sweeper so both
 // paths apply the same retry policy.
-func retryOrBury(ctx context.Context, rdb *redis.Client, actor string, job Job) {
+func retryOrBury(ctx context.Context, rdb *redis.Client, who actor, job Job) {
 	jobJSON, err := json.Marshal(job)
 	if err != nil {
-		log.Printf("\033[31m[%s] Error marshalling Job %s: %v\033[0m", actor, job.ID, err)
+		log.Printf("\033[31m[%s] Error marshalling Job %s: %v\033[0m", who.name, job.ID, err)
 		return
 	}
 
 	if job.Attempts < maxAttempts {
-		log.Printf("\033[35m[%s] 🔁 Requeueing Job %s (Attempt %d/%d)...\033[0m", actor, job.ID, job.Attempts, maxAttempts)
+		log.Printf("\033[35m[%s] 🔁 Requeueing Job %s (Attempt %d/%d)...\033[0m", who.name, job.ID, job.Attempts, maxAttempts)
 		if err := rdb.LPush(ctx, queueKey, jobJSON).Err(); err != nil {
-			log.Printf("\033[31m[%s] Error requeueing job %s: %v\033[0m", actor, job.ID, err)
+			log.Printf("\033[31m[%s] Error requeueing job %s: %v\033[0m", who.name, job.ID, err)
+			return
 		}
+		jobsRetried.WithLabelValues(who.label).Inc()
 		return
 	}
 
-	log.Printf("\033[1;31m[%s] 💀 Job %s failed permanently after %d attempts. Sending to DLQ.\033[0m", actor, job.ID, maxAttempts)
+	log.Printf("\033[1;31m[%s] 💀 Job %s failed permanently after %d attempts. Sending to DLQ.\033[0m", who.name, job.ID, maxAttempts)
 	if err := rdb.LPush(ctx, dlqKey, jobJSON).Err(); err != nil {
-		log.Printf("\033[31m[%s] Error sending job %s to DLQ: %v\033[0m", actor, job.ID, err)
+		log.Printf("\033[31m[%s] Error sending job %s to DLQ: %v\033[0m", who.name, job.ID, err)
+		return
 	}
+	jobsBuried.WithLabelValues(who.label).Inc()
 }
 
 // sweeper looks for jobs stranded in the in-flight list by a crashed worker.
@@ -377,10 +410,11 @@ func reclaim(ctx context.Context, rdb *redis.Client, jobJSON string) {
 		return
 	}
 
+	jobsRecovered.Inc()
 	job.Attempts++
 	log.Printf("\033[1;33m[Sweeper] ⚠️ Detected orphaned Job %s (Worker crashed). Reclaiming...\033[0m", job.ID)
 
 	dbCtx, dbCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer dbCancel()
-	retryOrBury(dbCtx, rdb, "Sweeper", job)
+	retryOrBury(dbCtx, rdb, actor{label: "sweeper", name: "Sweeper"}, job)
 }

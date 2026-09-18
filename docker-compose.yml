@@ -1,0 +1,74 @@
+# Local observability stack for the job queue.
+#
+#   docker compose up -d
+#
+# Then run the queue against it from the host:
+#   go run ./cmd/consumer     (serves metrics on :2112)
+#   go run ./cmd/producer     (enqueues jobs)
+#
+#   Grafana     http://localhost:3000   (admin / admin)
+#   Prometheus  http://localhost:9090
+#   Redis       localhost:6379
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: jobqueue-redis
+    ports:
+      - "6379:6379"
+    # appendonly keeps the queue across restarts, which matters when the
+    # whole point of the project is not losing jobs.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: jobqueue-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # Lets you POST to /-/reload after editing prometheus.yml instead of
+      # restarting the container.
+      - --web.enable-lifecycle
+    extra_hosts:
+      # Docker Desktop provides this automatically; declaring it keeps the
+      # file working on plain Linux Docker too.
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: jobqueue-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Local-only stack, so skip the login screen.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      # Provisioning means the datasource and dashboard exist on first boot;
+      # nothing has to be clicked together by hand, and the dashboard is
+      # version controlled like the rest of the project.
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  redis-data:
+  prometheus-data:
+  grafana-data:

@@ -1,0 +1,24 @@
+# Prometheus pulls metrics; nothing is pushed to it. Every interval it
+# fetches each target's /metrics URL and stores what it finds.
+global:
+  # How often to scrape. Shorter shows more detail but stores more data.
+  scrape_interval: 5s
+  # How long a scrape may take before it is recorded as failed.
+  scrape_timeout: 4s
+
+scrape_configs:
+  - job_name: jobqueue-consumer
+    static_configs:
+      # host.docker.internal resolves to the Windows/macOS host from inside
+      # the container, which is how Prometheus reaches a consumer started
+      # with `go run` outside Docker. If you containerise the consumer
+      # instead, change this to the service name, e.g. consumer:2112.
+      - targets: ["host.docker.internal:2112"]
+        labels:
+          service: jobqueue
+
+  # Prometheus scraping itself. Useful for confirming the stack is alive
+  # before blaming your own instrumentation.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

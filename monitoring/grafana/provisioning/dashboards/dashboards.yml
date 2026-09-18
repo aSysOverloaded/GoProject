@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: jobqueue
+    orgId: 1
+    type: file
+    disableDeletion: false
+    # Picks up edits to the JSON without restarting Grafana.
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -1,0 +1,331 @@
+{
+  "uid": "jobqueue-overview",
+  "title": "Job Queue Overview",
+  "description": "Throughput, latency, backlog and crash-recovery health for the distributed job queue.",
+  "tags": ["jobqueue", "redis"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Throughput",
+      "description": "Jobs completing per second, averaged over the last minute.",
+      "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+          "expr": "sum(rate(jobqueue_jobs_processed_total[1m]))",
+          "legendFormat": "jobs/sec"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "decimals": 1,
+          "color": { "mode": "fixed", "fixedColor": "blue" }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Failure rate",
+      "description": "Share of attempts that fail. The simulated workload fails 30% of the time, so this should sit near 30%.",
+      "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+          "expr": "sum(rate(jobqueue_jobs_processed_total{result=\"failure\"}[5m])) / clamp_min(sum(rate(jobqueue_jobs_processed_total[5m])), 0.0001)",
+          "legendFormat": "failure rate"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.4 },
+              { "color": "red", "value": 0.6 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Dead letter queue",
+      "description": "Jobs that exhausted all attempts and were buried.",
+      "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+          "expr": "sum(jobqueue_depth{structure=\"dlq\"})",
+          "legendFormat": "jobs"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Stale results discarded",
+      "description": "Workers that finished a job the sweeper had already reclaimed. This is the direct read-out of the visibility-timeout race and should stay at zero. Anything above zero means workers are outliving visTimeout.",
+      "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+          "expr": "sum(jobqueue_stale_results_discarded_total)",
+          "legendFormat": "discarded"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Job outcomes per second",
+      "description": "Counters are charted as rates, never as raw totals: a counter only ever climbs, so rate() is what turns it into a meaningful throughput line.",
+      "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+          "expr": "sum by (result) (rate(jobqueue_jobs_processed_total[1m]))",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": [] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "success" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "failure" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          }
+        ]
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Queue depth",
+      "description": "Gauges sampled straight from Redis. 'pending' is the backlog, 'inflight' is what workers hold, 'claimed' is the deadlines ZSET. inflight and claimed should track each other closely; a persistent gap means jobs are sitting in the in-flight list with no live owner.",
+      "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+          "expr": "sum by (structure) (jobqueue_depth)",
+          "legendFormat": "{{structure}}"
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": [] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Job duration percentiles",
+      "description": "Derived from the histogram buckets. p95 matters far more than an average here: the average hides the slow tail that trips the visibility timeout.",
+      "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(jobqueue_job_duration_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(jobqueue_job_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(jobqueue_job_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": [] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Crash recovery and retries",
+      "description": "Sweeper reclaims should only happen when a consumer genuinely dies. Before the heartbeat fix this line climbed continuously under normal load, because healthy-but-slow workers were being declared dead.",
+      "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+          "expr": "sum(rate(jobqueue_jobs_recovered_total[1m]))",
+          "legendFormat": "sweeper reclaims"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+          "expr": "sum by (source) (rate(jobqueue_jobs_retried_total[1m]))",
+          "legendFormat": "retries ({{source}})"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "jobqueue-prometheus" },
+          "expr": "sum by (source) (rate(jobqueue_jobs_dlq_total[1m]))",
+          "legendFormat": "buried ({{source}})"
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": [] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "sweeper reclaims" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }]
+          }
+        ]
+      }
+    }
+  ]
+}

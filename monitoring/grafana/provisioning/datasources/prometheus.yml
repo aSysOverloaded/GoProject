@@ -1,0 +1,12 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # Service name from docker-compose, not localhost: Grafana reaches
+    # Prometheus over the compose network, not the host.
+    url: http://prometheus:9090
+    isDefault: true
+    uid: jobqueue-prometheus
+    editable: false

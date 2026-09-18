@@ -3,11 +3,17 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -259,7 +265,7 @@ func TestRetryOrBuryRoutesToDLQAtMaxAttempts(t *testing.T) {
 	rdb := newTestRedis(t)
 	ctx := context.Background()
 
-	retryOrBury(ctx, rdb, "Worker 1", Job{ID: "job-retry", Attempts: maxAttempts - 1})
+	retryOrBury(ctx, rdb, actor{label: "worker", name: "Worker 1"}, Job{ID: "job-retry", Attempts: maxAttempts - 1})
 	if got := queueContents(t, rdb, queueKey); len(got) != 1 {
 		t.Errorf("job below the attempt limit should be requeued, queue has %d entries", len(got))
 	}
@@ -267,11 +273,139 @@ func TestRetryOrBuryRoutesToDLQAtMaxAttempts(t *testing.T) {
 		t.Errorf("job below the attempt limit should not be buried, DLQ has %d entries", len(got))
 	}
 
-	retryOrBury(ctx, rdb, "Worker 1", Job{ID: "job-dead", Attempts: maxAttempts})
+	retryOrBury(ctx, rdb, actor{label: "worker", name: "Worker 1"}, Job{ID: "job-dead", Attempts: maxAttempts})
 	if got := queueContents(t, rdb, dlqKey); len(got) != 1 {
 		t.Errorf("job at the attempt limit should go to the DLQ, DLQ has %d entries", len(got))
 	}
 	if got := queueContents(t, rdb, queueKey); len(got) != 1 {
 		t.Errorf("job at the attempt limit should not be requeued, queue has %d entries", len(got))
 	}
+}
+
+// TestMetricsTrackJobOutcomes checks the counters actually move, and move on
+// the right paths. Counters are process-global, so every assertion here is a
+// delta rather than an absolute value.
+func TestMetricsTrackJobOutcomes(t *testing.T) {
+	useFastTimings(t)
+	rdb := newTestRedis(t)
+	ctx := context.Background()
+
+	before := map[string]float64{
+		"success":  testutil.ToFloat64(jobsProcessed.WithLabelValues("success")),
+		"failure":  testutil.ToFloat64(jobsProcessed.WithLabelValues("failure")),
+		"retried":  testutil.ToFloat64(jobsRetried.WithLabelValues("worker")),
+		"buried":   testutil.ToFloat64(jobsBuried.WithLabelValues("worker")),
+		"stale":    testutil.ToFloat64(staleResults),
+		"recovers": testutil.ToFloat64(jobsRecovered),
+	}
+	delta := func(key string, now float64) float64 { return now - before[key] }
+
+	// A job that succeeds.
+	ok := Job{ID: "m-ok"}
+	okJSON := mustMarshal(t, ok)
+	rdb.RPush(ctx, inflightKey, okJSON)
+	rdb.ZAdd(ctx, deadlinesKey, redis.Z{Score: deadlineFrom(time.Now()), Member: okJSON})
+	settle(1, rdb, ok, okJSON, true, 300*time.Millisecond)
+
+	// A job that fails and still has attempts left.
+	bad := Job{ID: "m-bad"}
+	badJSON := mustMarshal(t, bad)
+	rdb.RPush(ctx, inflightKey, badJSON)
+	rdb.ZAdd(ctx, deadlinesKey, redis.Z{Score: deadlineFrom(time.Now()), Member: badJSON})
+	settle(1, rdb, bad, badJSON, false, 400*time.Millisecond)
+
+	// A worker reporting on a job the sweeper already took.
+	lost := Job{ID: "m-lost"}
+	lostJSON := mustMarshal(t, lost)
+	settle(1, rdb, lost, lostJSON, true, 100*time.Millisecond)
+
+	// A sweeper reclaim.
+	orphan := Job{ID: "m-orphan"}
+	orphanJSON := mustMarshal(t, orphan)
+	rdb.RPush(ctx, inflightKey, orphanJSON)
+	rdb.ZAdd(ctx, deadlinesKey, redis.Z{
+		Score:  float64(time.Now().Add(-time.Minute).UnixMilli()),
+		Member: orphanJSON,
+	})
+	reclaim(ctx, rdb, orphanJSON)
+
+	checks := []struct {
+		name string
+		got  float64
+		want float64
+	}{
+		{"jobs_processed_total{result=success}", delta("success", testutil.ToFloat64(jobsProcessed.WithLabelValues("success"))), 1},
+		{"jobs_processed_total{result=failure}", delta("failure", testutil.ToFloat64(jobsProcessed.WithLabelValues("failure"))), 1},
+		{"jobs_retried_total{source=worker}", delta("retried", testutil.ToFloat64(jobsRetried.WithLabelValues("worker"))), 1},
+		{"jobs_dlq_total{source=worker}", delta("buried", testutil.ToFloat64(jobsBuried.WithLabelValues("worker"))), 0},
+		{"stale_results_discarded_total", delta("stale", testutil.ToFloat64(staleResults)), 1},
+		{"jobs_recovered_total", delta("recovers", testutil.ToFloat64(jobsRecovered)), 1},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s moved by %v, want %v", c.name, c.got, c.want)
+		}
+	}
+}
+
+// TestMetricsEndpointServesRegistry is a smoke test that the HTTP surface
+// Prometheus scrapes is actually wired up.
+func TestMetricsEndpointServesRegistry(t *testing.T) {
+	jobsProcessed.WithLabelValues("success").Inc()
+
+	srv := httptest.NewServer(promhttp.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /metrics status = %d, want 200", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	for _, want := range []string{
+		"jobqueue_jobs_processed_total",
+		"jobqueue_jobs_recovered_total",
+		"jobqueue_stale_results_discarded_total",
+		"jobqueue_job_duration_seconds_bucket",
+		"jobqueue_depth",
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("/metrics output is missing %q", want)
+		}
+	}
+}
+
+// TestPollQueueDepthsReportsRedisState checks the gauges reflect Redis rather
+// than drifting from it.
+func TestPollQueueDepthsReportsRedisState(t *testing.T) {
+	rdb := newTestRedis(t)
+	ctx := context.Background()
+
+	oldInterval := depthPollInterval
+	depthPollInterval = 20 * time.Millisecond
+	t.Cleanup(func() { depthPollInterval = oldInterval })
+
+	rdb.RPush(ctx, queueKey, "a", "b", "c")
+	rdb.RPush(ctx, inflightKey, "d")
+	rdb.RPush(ctx, dlqKey, "e", "f")
+
+	pollCtx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go pollQueueDepths(pollCtx, rdb, &wg)
+	t.Cleanup(func() { cancel(); wg.Wait() })
+
+	waitFor(t, 2*time.Second, "gauges to match Redis", func() bool {
+		return testutil.ToFloat64(queueDepth.WithLabelValues("pending")) == 3 &&
+			testutil.ToFloat64(queueDepth.WithLabelValues("inflight")) == 1 &&
+			testutil.ToFloat64(queueDepth.WithLabelValues("dlq")) == 2
+	})
 }
