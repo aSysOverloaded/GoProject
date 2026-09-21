@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -100,11 +101,25 @@ func newPublisher() *publisher {
 		// Small linger batches events without adding meaningful latency,
 		// since production is asynchronous anyway.
 		kgo.ProducerLinger(20*time.Millisecond),
+
+		// Surface client-level problems (connection refused, unknown topic,
+		// auth) instead of letting them vanish into a counter.
+		kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelWarn, func() string {
+			return "[Kafka] "
+		})),
 	)
 	if err != nil {
 		log.Printf("\033[31m[Events] Failed to create Kafka client, continuing without events: %v\033[0m", err)
 		return nil
 	}
+
+	// Create the topic explicitly rather than relying on the broker's
+	// auto-create. Auto-create is disabled on most real clusters, and even
+	// where it is on it silently gives you the broker's default partition
+	// count and replication factor - which is how a topic ends up with one
+	// partition and no redundancy in production. Being explicit means the
+	// partition count is a decision, not an accident.
+	ensureTopic(client, topic)
 
 	host, _ := os.Hostname()
 	if podName := os.Getenv("POD_NAME"); podName != "" {
@@ -113,6 +128,49 @@ func newPublisher() *publisher {
 
 	log.Printf("\033[1;34m[Events] Publishing job events to Kafka topic %q via %s\033[0m", topic, brokers)
 	return &publisher{client: client, topic: topic, host: host}
+}
+
+// ensureTopic creates the events topic if it does not exist. Several
+// consumers starting at once will race; all but one get TOPIC_ALREADY_EXISTS,
+// which is not an error condition.
+func ensureTopic(client *kgo.Client, topic string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	partitions := int32(3)
+	if v := os.Getenv("KAFKA_PARTITIONS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			partitions = int32(n)
+		}
+	}
+
+	// Replication factor 1 because this runs against a single broker. A real
+	// cluster wants 3, together with min.insync.replicas=2 and acks=all -
+	// all three are needed for durability, and acks=all alone on an
+	// unreplicated topic buys nothing.
+	replication := int16(1)
+	if v := os.Getenv("KAFKA_REPLICATION_FACTOR"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			replication = int16(n)
+		}
+	}
+
+	admin := kadm.NewClient(client)
+	resp, err := admin.CreateTopic(ctx, partitions, replication, nil, topic)
+	if err != nil {
+		log.Printf("\033[1;33m[Events] Could not create topic %q (it may already exist): %v\033[0m", topic, err)
+		return
+	}
+	if resp.Err != nil {
+		if strings.Contains(resp.Err.Error(), "TOPIC_ALREADY_EXISTS") {
+			log.Printf("\033[1;30m[Events] Topic %q already exists\033[0m", topic)
+			return
+		}
+		log.Printf("\033[1;33m[Events] Topic %q creation reported: %v\033[0m", topic, resp.Err)
+		return
+	}
+	log.Printf("\033[1;32m[Events] Created topic %q with %d partitions, replication factor %d\033[0m",
+		topic, partitions, replication)
 }
 
 // publish sends an event without blocking the caller.
@@ -156,8 +214,14 @@ func (p *publisher) publish(ev JobEvent) {
 
 	p.client.Produce(context.Background(), record, func(_ *kgo.Record, err error) {
 		if err != nil {
-			p.failed.Add(1)
+			n := p.failed.Add(1)
 			kafkaPublishErrors.Inc()
+			// Log the first failure and then every 100th. Silently counting
+			// errors makes a broken event stream impossible to diagnose,
+			// but logging every one would drown the job logs.
+			if n == 1 || n%100 == 0 {
+				log.Printf("\033[31m[Events] Publish failed (%d so far): %v\033[0m", n, err)
+			}
 			return
 		}
 		p.published.Add(1)

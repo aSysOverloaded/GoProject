@@ -15,7 +15,11 @@
 #   Kafka UI    http://localhost:8080   (topics, messages, consumer lag)
 #   Redis       localhost:6379
 #   Kafka       localhost:9092
-#   Postgres    localhost:5432          (postgres / postgres, db jobqueue)
+#   Postgres    localhost:5433          (postgres / postgres, db jobqueue)
+#
+# Postgres is on 5433 to avoid clashing with a locally installed PostgreSQL
+# service, which usually owns 5432:
+#   DATABASE_URL=postgres://postgres:postgres@localhost:5433/jobqueue?sslmode=disable
 
 services:
   redis:
@@ -37,39 +41,55 @@ services:
   # Kafka in KRaft mode: no ZooKeeper. Modern Kafka runs its own consensus,
   # so the two-container setup you will see in older tutorials is obsolete.
   kafka:
-    image: bitnami/kafka:3.7
+    image: apache/kafka:3.9.0
     container_name: jobqueue-kafka
     ports:
       - "9092:9092"
     environment:
-      # This node is both controller and broker - fine for local work, never
-      # for production, where those roles are separated.
-      KAFKA_CFG_NODE_ID: "0"
-      KAFKA_CFG_PROCESS_ROLES: "controller,broker"
-      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "0@kafka:9093"
-      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
-      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092"
-      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
-      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      # This node is both controller and broker - fine locally, never in
+      # production, where those roles are separated.
+      KAFKA_NODE_ID: "0"
+      KAFKA_PROCESS_ROLES: "controller,broker"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "0@kafka:9093"
+
+      # Two client listeners, and this is the single most common thing
+      # people get wrong about Kafka networking.
+      #
+      # A client's first connection is only to discover the cluster; the
+      # broker replies with its ADVERTISED address and the client reconnects
+      # to that. So the advertised address must be reachable *from the
+      # client*, not from the broker. A container reaches Kafka at
+      # "kafka", the host reaches it at "localhost" - one address cannot be
+      # both, which is why there are two listeners on two ports.
+      KAFKA_LISTENERS: "CONTROLLER://:9093,INTERNAL://:19092,EXTERNAL://:9092"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:19092,EXTERNAL://localhost:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+
       # One broker cannot replicate to itself, so everything is RF=1 here.
       # In a real cluster these would be 3, and that difference is the whole
-      # durability story: with RF=1 a broker loss is data loss.
-      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
-      KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
-      KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: "1"
-      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
-      KAFKA_CFG_NUM_PARTITIONS: "3"
+      # durability story: with RF=1 a broker loss is data loss, and acks=all
+      # is only as safe as acks=1.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: "3"
       # Keep a week of events. This retention window is what makes replay
       # possible, and it is the main thing Redis cannot offer.
-      KAFKA_CFG_LOG_RETENTION_HOURS: "168"
-      ALLOW_PLAINTEXT_LISTENER: "yes"
+      KAFKA_LOG_RETENTION_HOURS: "168"
+      # Do not wait the default 3s for more group members to join before
+      # rebalancing; locally there is only ever one.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
     volumes:
-      - kafka-data:/bitnami/kafka
+      - kafka-data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:19092 --list || exit 1"]
       interval: 10s
       timeout: 10s
-      retries: 10
+      retries: 12
       start_period: 30s
 
   # Kafka UI: browse topics, inspect messages, watch consumer group lag.
@@ -82,7 +102,8 @@ services:
       - "8080:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: local
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      # The INTERNAL listener, because kafka-ui is itself a container.
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
       DYNAMIC_CONFIG_ENABLED: "true"
     depends_on:
       kafka:
@@ -93,7 +114,12 @@ services:
     image: postgres:16-alpine
     container_name: jobqueue-postgres
     ports:
-      - "5432:5432"
+      # 5433 on the host, not 5432: a locally installed PostgreSQL service
+      # commonly already owns 5432, and the clash is silent - you connect
+      # successfully to the wrong database and get an authentication error
+      # that looks like a config bug. Inside the compose network other
+      # containers still use postgres:5432.
+      - "5433:5432"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres

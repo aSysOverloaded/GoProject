@@ -95,13 +95,23 @@ func main() {
 		log.Println("[DB] job_events table already present.")
 	}
 
-	resetOffset := kgo.NewOffset().AtCommitted()
+	// ConsumeResetOffset is the fallback for when the group has NO committed
+	// offset - it does not override existing commits. AtStart means a
+	// brand-new group reads the whole retained topic rather than silently
+	// skipping everything published before it started.
+	resetOffset := kgo.NewOffset().AtStart()
+
 	if *fromStart {
-		// Replay. Because the writes are idempotent on event_id, re-reading
-		// the whole topic re-derives the same table rather than duplicating
-		// it. This is the property that makes a log worth keeping.
-		log.Println("[Kafka] --from-start: replaying the topic from the beginning")
-		resetOffset = kgo.NewOffset().AtStart()
+		// Replaying an existing group cannot be done by changing the reset
+		// policy, because its committed offsets take precedence. Consuming
+		// under a fresh group name has no commits, so it starts from the
+		// beginning of whatever Kafka still retains.
+		//
+		// Because the inserts are idempotent on event_id, replaying
+		// re-derives the same table instead of duplicating it. That is the
+		// property that makes keeping a log worthwhile.
+		group = fmt.Sprintf("%s-replay-%d", group, time.Now().Unix())
+		log.Printf("[Kafka] --from-start: replaying the topic under fresh group %q", group)
 	}
 
 	client, err := kgo.NewClient(
