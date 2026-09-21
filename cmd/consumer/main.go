@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math/rand"
 	"os"
 	"os/signal"
 	"sync"
@@ -18,13 +17,17 @@ import (
 )
 
 type Job struct {
-	ID       string `json:"id"`
+	ID string `json:"id"`
+	// Type selects the handler. omitempty keeps the serialised form identical
+	// to the old one for untyped jobs, which matters because the JSON string
+	// is itself the ZSET member used for ownership matching.
+	Type     string `json:"type,omitempty"`
 	Payload  string `json:"payload"`
 	Attempts int    `json:"attempts"`
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
+	// Go 1.20+ seeds the global source automatically; rand.Seed is deprecated.
 
 	// Load .env file if it exists
 	if err := godotenv.Load(); err != nil {
@@ -32,16 +35,14 @@ func main() {
 	}
 
 	fmt.Println("\033[1;35m==================================================\033[0m")
-	fmt.Println("\033[1;35m      🚀 Distributed Job Queue - Consumer (M5)     \033[0m")
+	fmt.Println("\033[1;35m      🚀 Distributed Job Queue - Consumer (M6)     \033[0m")
 	fmt.Println("\033[1;35m==================================================\033[0m")
 
-	redisURL := os.Getenv("REDIS_URL")
-	if redisURL == "" {
-		redisURL = "redis://localhost:6379/0"
-	}
+	cfg := loadConfig()
+	cfg.apply()
 
 	log.Printf("\033[1;34m[System] Connecting to Redis...\033[0m")
-	opt, err := redis.ParseURL(redisURL)
+	opt, err := redis.ParseURL(cfg.RedisURL)
 	if err != nil {
 		log.Fatalf("\033[1;31m[System] Invalid Redis URL: %v\033[0m", err)
 	}
@@ -63,18 +64,13 @@ func main() {
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 
-	metricsAddr := os.Getenv("METRICS_ADDR")
-	if metricsAddr == "" {
-		metricsAddr = ":2112"
-	}
-	metricsSrv := serveMetrics(metricsAddr)
+	metricsSrv := serveMetrics(cfg.MetricsAddr)
 
 	wg.Add(1)
 	go pollQueueDepths(runCtx, rdb, &wg)
 
-	numWorkers := 3
-	log.Printf("\033[1;34m[System] Starting %d workers...\033[0m", numWorkers)
-	for i := 1; i <= numWorkers; i++ {
+	log.Printf("\033[1;34m[System] Starting %d workers (%d handler(s) registered)...\033[0m", cfg.NumWorkers, len(handlers))
+	for i := 1; i <= cfg.NumWorkers; i++ {
 		wg.Add(1)
 		go worker(runCtx, i, rdb, &wg)
 	}
@@ -82,6 +78,11 @@ func main() {
 	// Start background sweeper for crash recovery
 	wg.Add(1)
 	go sweeper(runCtx, rdb, &wg)
+
+	// Start the promoter, which moves jobs whose backoff has elapsed from the
+	// delayed ZSET back onto the main queue.
+	wg.Add(1)
+	go promoter(runCtx, rdb, &wg)
 
 	// Set up OS signal channel for graceful shutdown detection
 	sigChan := make(chan os.Signal, 1)
@@ -94,9 +95,16 @@ func main() {
 	// Cancel context to notify workers and sweeper to stop
 	cancelRun()
 
-	// Wait for workers and sweeper to finish
-	log.Printf("\033[1;33m[System] Waiting for workers and sweeper to complete...\033[0m")
-	wg.Wait()
+	// Wait for the background goroutines, but not forever. A handler that
+	// hangs must not stop the process from exiting: an orchestrator that gets
+	// no response to SIGTERM escalates to SIGKILL, which is exactly the
+	// ungraceful crash the whole sweeper exists to clean up after. Better to
+	// exit deliberately and let the sweeper reclaim whatever was in flight.
+	log.Printf("\033[1;33m[System] Waiting up to %v for workers and sweeper to complete...\033[0m", cfg.ShutdownTimeout)
+	if !waitTimeout(&wg, cfg.ShutdownTimeout) {
+		log.Printf("\033[1;31m[System] Shutdown deadline exceeded; exiting with jobs still in flight. The sweeper will reclaim them after the visibility timeout.\033[0m")
+		shutdownsForced.Inc()
+	}
 
 	// Stop serving metrics last, so a final scrape can still catch the
 	// counters from the jobs we just drained.
@@ -109,13 +117,36 @@ func main() {
 	log.Printf("\033[1;32m[System] Shutdown complete.\033[0m")
 }
 
+// waitTimeout waits for wg, returning false if the deadline passes first.
+// sync.WaitGroup has no timed Wait, so the wait is moved onto a channel that
+// can be raced against a timer.
+func waitTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 const (
 	queueKey     = "jobs:queue"
 	inflightKey  = "jobs:inflight"
 	deadlinesKey = "jobs:deadlines"
 	dlqKey       = "jobs:dlq"
-
-	maxAttempts = 3
+	// delayedKey holds jobs waiting out their retry backoff, scored by the
+	// epoch-ms at which they become eligible to run again.
+	delayedKey = "jobs:delayed"
+	// poisonKey holds payloads that could not be parsed at all. They are kept
+	// separate from the DLQ so that the DLQ stays machine-readable and can be
+	// replayed without tripping over garbage.
+	poisonKey = "jobs:poison"
 )
 
 // Timings live in vars rather than consts so the tests can compress them.
@@ -130,6 +161,16 @@ var (
 	// blockTimeout is how long BLMOVE parks on an empty queue. Longer means
 	// fewer commands billed against Upstash while idle.
 	blockTimeout = 15 * time.Second
+
+	maxAttempts = 3
+
+	// Retry backoff. Delay for attempt n is baseRetryDelay * 2^(n-1), capped
+	// at maxRetryDelay, then jittered.
+	baseRetryDelay = 1 * time.Second
+	maxRetryDelay  = 5 * time.Minute
+	// promoteTick is how often the promoter moves due jobs out of the delayed
+	// set and back onto the queue.
+	promoteTick = 1 * time.Second
 )
 
 // deadlineFrom returns the ZSET score for a claim made now. Scores are
@@ -176,17 +217,13 @@ func worker(ctx context.Context, id int, rdb *redis.Client, wg *sync.WaitGroup) 
 func handleJob(workerID int, rdb *redis.Client, jobJSON string) {
 	var job Job
 	if err := json.Unmarshal([]byte(jobJSON), &job); err != nil {
-		log.Printf("\033[31m[Worker %d] Error parsing job JSON: %v\033[0m", workerID, err)
-		// Drop the unparseable payload out of the in-flight list, otherwise the
-		// sweeper would rediscover it forever.
-		dropCtx, dropCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		rdb.LRem(dropCtx, inflightKey, 1, jobJSON)
-		rdb.ZRem(dropCtx, deadlinesKey, jobJSON)
-		dropCancel()
+		log.Printf("\033[1;31m[Worker %d] ☠️ Unparseable payload, quarantining to %s: %v\033[0m", workerID, poisonKey, err)
+		quarantine(rdb, jobJSON)
 		return
 	}
 
-	log.Printf("\033[34m[Worker %d] ➡️ Processing Job %s - Attempt %d/%d\033[0m", workerID, job.ID, job.Attempts+1, maxAttempts)
+	log.Printf("\033[34m[Worker %d] ➡️ Processing Job %s (type %q) - Attempt %d/%d\033[0m",
+		workerID, job.ID, job.Type, job.Attempts+1, attemptsFor(job.Type))
 
 	claimCtx, claimCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	err := rdb.ZAdd(claimCtx, deadlinesKey, redis.Z{
@@ -203,10 +240,31 @@ func handleJob(workerID int, rdb *redis.Client, jobJSON string) {
 	hbCtx, stopHeartbeat := context.WithCancel(context.Background())
 	go heartbeat(hbCtx, workerID, rdb, job.ID, jobJSON)
 
-	success, workDuration := processJob(job)
+	runErr, workDuration := dispatch(job)
 
 	stopHeartbeat()
-	settle(workerID, rdb, job, jobJSON, success, workDuration)
+	settle(workerID, rdb, job, jobJSON, runErr, workDuration)
+}
+
+// quarantine moves a payload we cannot parse into the poison list. It used to
+// be deleted outright, which is silent data loss in a project whose entire
+// premise is not losing jobs. It cannot go to the DLQ, because the DLQ is
+// expected to hold valid job JSON that a replay tool can read back.
+func quarantine(rdb *redis.Client, rawPayload string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := rdb.LPush(ctx, poisonKey, rawPayload).Err(); err != nil {
+		// Deliberately do NOT remove it from the in-flight list if we could
+		// not save it: leaving it there means the sweeper retries later,
+		// which is far better than dropping it.
+		log.Printf("\033[31m[Worker] Failed to quarantine payload, leaving it in flight for the sweeper: %v\033[0m", err)
+		return
+	}
+
+	rdb.LRem(ctx, inflightKey, 1, rawPayload)
+	rdb.ZRem(ctx, deadlinesKey, rawPayload)
+	jobsPoisoned.Inc()
 }
 
 // heartbeat pushes the job's deadline further out at a steady tick. It only
@@ -237,18 +295,9 @@ func heartbeat(ctx context.Context, workerID int, rdb *redis.Client, jobID, jobJ
 	}
 }
 
-// processJob is the pure "do the work" step: no Redis, no bookkeeping.
-func processJob(job Job) (success bool, workDuration time.Duration) {
-	// Simulate work duration: random between 200ms and 800ms
-	workDuration = time.Duration(200+rand.Intn(600)) * time.Millisecond
-	time.Sleep(workDuration)
-
-	// Simulate 30% failure rate
-	return rand.Float32() >= 0.3, workDuration
-}
-
-// settle records the outcome of a job the worker just finished.
-func settle(workerID int, rdb *redis.Client, job Job, jobJSON string, success bool, workDuration time.Duration) {
+// settle records the outcome of a job the worker just finished. A nil runErr
+// means success.
+func settle(workerID int, rdb *redis.Client, job Job, jobJSON string, runErr error, workDuration time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -274,16 +323,18 @@ func settle(workerID int, rdb *redis.Client, job Job, jobJSON string, success bo
 
 	jobDuration.Observe(workDuration.Seconds())
 
-	if success {
+	if runErr == nil {
 		jobsProcessed.WithLabelValues("success").Inc()
-		log.Printf("\033[32m[Worker %d] ✅ Job %s completed successfully in %v\033[0m", workerID, job.ID, workDuration)
+		log.Printf("\033[32m[Worker %d] ✅ Job %s completed successfully in %v\033[0m", workerID, job.ID, workDuration.Round(time.Millisecond))
 		return
 	}
 
 	jobsProcessed.WithLabelValues("failure").Inc()
 	job.Attempts++
-	log.Printf("\033[31m[Worker %d] ❌ Job %s FAILED (Attempt %d/%d)\033[0m", workerID, job.ID, job.Attempts, maxAttempts)
-	retryOrBury(ctx, rdb, actor{label: "worker", name: fmt.Sprintf("Worker %d", workerID)}, job)
+	log.Printf("\033[31m[Worker %d] ❌ Job %s FAILED (Attempt %d/%d): %v\033[0m",
+		workerID, job.ID, job.Attempts, attemptsFor(job.Type), runErr)
+
+	retryOrBury(ctx, rdb, actor{label: "worker", name: fmt.Sprintf("Worker %d", workerID)}, job, runErr)
 }
 
 // actor identifies who is applying the retry policy: name is for humans
@@ -293,32 +344,47 @@ type actor struct {
 	name  string
 }
 
-// retryOrBury pushes a failed job back onto the queue, or into the DLQ once it
-// has burned through its attempts. Shared by the worker and the sweeper so both
-// paths apply the same retry policy.
-func retryOrBury(ctx context.Context, rdb *redis.Client, who actor, job Job) {
+// retryOrBury applies the retry policy to a failed job. Shared by the worker
+// and the sweeper so both paths behave identically.
+//
+// runErr is the handler's error, or nil when the sweeper is recovering a job
+// whose worker died and therefore never produced one.
+func retryOrBury(ctx context.Context, rdb *redis.Client, who actor, job Job, runErr error) {
 	jobJSON, err := json.Marshal(job)
 	if err != nil {
 		log.Printf("\033[31m[%s] Error marshalling Job %s: %v\033[0m", who.name, job.ID, err)
 		return
 	}
 
-	if job.Attempts < maxAttempts {
-		log.Printf("\033[35m[%s] 🔁 Requeueing Job %s (Attempt %d/%d)...\033[0m", who.name, job.ID, job.Attempts, maxAttempts)
-		if err := rdb.LPush(ctx, queueKey, jobJSON).Err(); err != nil {
-			log.Printf("\033[31m[%s] Error requeueing job %s: %v\033[0m", who.name, job.ID, err)
-			return
+	// A permanent error will fail identically on every future attempt, so
+	// spending the remaining budget (and the backoff waits) on it is pure
+	// latency for a guaranteed outcome. Bury it immediately.
+	permanent := errors.Is(runErr, ErrPermanent)
+	budget := attemptsFor(job.Type)
+
+	if !permanent && job.Attempts < budget {
+		if err := scheduleRetry(ctx, rdb, who, job, string(jobJSON)); err != nil {
+			log.Printf("\033[31m[%s] Error scheduling retry for job %s: %v\033[0m", who.name, job.ID, err)
 		}
-		jobsRetried.WithLabelValues(who.label).Inc()
 		return
 	}
 
-	log.Printf("\033[1;31m[%s] 💀 Job %s failed permanently after %d attempts. Sending to DLQ.\033[0m", who.name, job.ID, maxAttempts)
+	if permanent {
+		log.Printf("\033[1;31m[%s] 💀 Job %s failed permanently (not retryable). Sending to DLQ.\033[0m", who.name, job.ID)
+	} else {
+		log.Printf("\033[1;31m[%s] 💀 Job %s exhausted %d attempts. Sending to DLQ.\033[0m", who.name, job.ID, budget)
+	}
+
 	if err := rdb.LPush(ctx, dlqKey, jobJSON).Err(); err != nil {
 		log.Printf("\033[31m[%s] Error sending job %s to DLQ: %v\033[0m", who.name, job.ID, err)
 		return
 	}
-	jobsBuried.WithLabelValues(who.label).Inc()
+
+	reason := "exhausted"
+	if permanent {
+		reason = "permanent"
+	}
+	jobsBuried.WithLabelValues(who.label, reason).Inc()
 }
 
 // sweeper looks for jobs stranded in the in-flight list by a crashed worker.
@@ -416,5 +482,7 @@ func reclaim(ctx context.Context, rdb *redis.Client, jobJSON string) {
 
 	dbCtx, dbCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer dbCancel()
-	retryOrBury(dbCtx, rdb, actor{label: "sweeper", name: "Sweeper"}, job)
+	// nil error: the worker died, so it never reported why. A crash is always
+	// treated as retryable.
+	retryOrBury(dbCtx, rdb, actor{label: "sweeper", name: "Sweeper"}, job, nil)
 }

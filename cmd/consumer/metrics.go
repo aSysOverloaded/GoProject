@@ -37,10 +37,44 @@ var (
 		Help: "Jobs pushed back onto the queue for another attempt.",
 	}, []string{"source"})
 
+	// reason distinguishes a job that burned through its retry budget from one
+	// whose handler reported ErrPermanent and was buried on the first failure.
+	// They call for different responses: the first suggests a flaky
+	// dependency, the second a bad payload or a bug.
 	jobsBuried = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "jobqueue_jobs_dlq_total",
-		Help: "Jobs sent to the dead letter queue after exhausting their attempts.",
-	}, []string{"source"})
+		Help: "Jobs sent to the dead letter queue, by who buried it and why.",
+	}, []string{"source", "reason"})
+
+	// jobsPoisoned counts payloads that could not be parsed as a Job at all.
+	// Non-zero means something is writing malformed data to the queue.
+	jobsPoisoned = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "jobqueue_jobs_poisoned_total",
+		Help: "Payloads quarantined because they could not be parsed as a job.",
+	})
+
+	// jobsPromoted counts jobs moved out of the delayed set once their retry
+	// backoff elapsed.
+	jobsPromoted = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "jobqueue_jobs_promoted_total",
+		Help: "Delayed jobs promoted back onto the main queue after their backoff elapsed.",
+	})
+
+	// retryDelay records how long jobs are made to wait before a retry, which
+	// is how you confirm the exponential backoff is actually backing off
+	// rather than hammering.
+	retryDelay = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "jobqueue_retry_delay_seconds",
+		Help:    "Backoff applied before a job's next attempt.",
+		Buckets: prometheus.ExponentialBuckets(0.5, 2, 10),
+	})
+
+	// shutdownsForced counts exits where the shutdown deadline elapsed with
+	// work still in flight. Non-zero means a handler is ignoring its context.
+	shutdownsForced = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "jobqueue_forced_shutdowns_total",
+		Help: "Shutdowns that hit the deadline with jobs still running.",
+	})
 
 	// jobsRecovered counts sweeper reclaims. Before the heartbeat fix this
 	// climbed steadily even with no crashes, because slow-but-healthy
@@ -92,9 +126,11 @@ func init() {
 	}
 	for _, source := range []string{"worker", "sweeper"} {
 		jobsRetried.WithLabelValues(source)
-		jobsBuried.WithLabelValues(source)
+		for _, reason := range []string{"exhausted", "permanent"} {
+			jobsBuried.WithLabelValues(source, reason)
+		}
 	}
-	for _, structure := range []string{"pending", "inflight", "dlq", "claimed"} {
+	for _, structure := range []string{"pending", "inflight", "dlq", "claimed", "delayed", "poison"} {
 		queueDepth.WithLabelValues(structure)
 	}
 }
@@ -133,7 +169,9 @@ func pollQueueDepths(ctx context.Context, rdb *redis.Client, wg *sync.WaitGroup)
 		pending := pipe.LLen(ctx, queueKey)
 		inflight := pipe.LLen(ctx, inflightKey)
 		dead := pipe.LLen(ctx, dlqKey)
+		poison := pipe.LLen(ctx, poisonKey)
 		claimed := pipe.ZCard(ctx, deadlinesKey)
+		delayed := pipe.ZCard(ctx, delayedKey)
 
 		if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
 			if !errors.Is(err, context.Canceled) {
@@ -145,7 +183,9 @@ func pollQueueDepths(ctx context.Context, rdb *redis.Client, wg *sync.WaitGroup)
 		queueDepth.WithLabelValues("pending").Set(float64(pending.Val()))
 		queueDepth.WithLabelValues("inflight").Set(float64(inflight.Val()))
 		queueDepth.WithLabelValues("dlq").Set(float64(dead.Val()))
+		queueDepth.WithLabelValues("poison").Set(float64(poison.Val()))
 		queueDepth.WithLabelValues("claimed").Set(float64(claimed.Val()))
+		queueDepth.WithLabelValues("delayed").Set(float64(delayed.Val()))
 	}
 
 	// Take one sample immediately so the dashboard is populated before the

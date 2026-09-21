@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch makes an in-flight run irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # The reason this workflow earns its keep. The race detector needs cgo
+      # and a 64-bit gcc, which is not available on the Windows machine this
+      # project is developed on - so this is the only place the worker pool,
+      # the per-job heartbeat goroutines, the sweeper and the promoter are
+      # ever checked for data races.
+      - name: Test with race detector
+        run: go test -race -count=1 ./...
+
+      # Run the concurrency-sensitive tests repeatedly. They coordinate real
+      # goroutines against timers, so a flake that shows up 1 run in 20 is
+      # exactly the kind of bug worth catching before it lands.
+      - name: Re-run concurrency tests to catch flakes
+        run: go test -race -count=5 -run 'Heartbeat|Sweeper|Reclaim|Promoter|Crash' ./cmd/consumer/
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      # The unit tests use miniredis, which is a reimplementation of Redis
+      # rather than Redis itself. This job runs the same suite against the
+      # real server so a behavioural difference cannot hide.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Smoke test against real Redis
+        env:
+          REDIS_URL: redis://localhost:6379/0
+          WORKER_COUNT: "4"
+          METRICS_ADDR: ":2112"
+          # Keep the run short: small backoffs, quick sweeps.
+          BASE_RETRY_DELAY: 50ms
+          MAX_RETRY_DELAY: 200ms
+          PROMOTE_INTERVAL: 100ms
+          SWEEP_INTERVAL: 200ms
+        run: |
+          set -euo pipefail
+
+          go build -o /tmp/consumer ./cmd/consumer
+          go build -o /tmp/producer ./cmd/producer
+
+          /tmp/consumer & CONSUMER_PID=$!
+          trap 'kill $CONSUMER_PID 2>/dev/null || true' EXIT
+
+          # Wait for the metrics endpoint to answer.
+          for i in $(seq 1 30); do
+            if curl -sf localhost:2112/healthz >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf localhost:2112/healthz >/dev/null || { echo "consumer never became healthy"; exit 1; }
+
+          /tmp/producer
+
+          # Wait for the queue to drain: pending, in-flight and delayed all zero.
+          for i in $(seq 1 60); do
+            metrics=$(curl -sf localhost:2112/metrics)
+            pending=$(echo "$metrics"  | awk -F' ' '/^jobqueue_depth\{structure="pending"\}/  {print $2}')
+            inflight=$(echo "$metrics" | awk -F' ' '/^jobqueue_depth\{structure="inflight"\}/ {print $2}')
+            delayed=$(echo "$metrics"  | awk -F' ' '/^jobqueue_depth\{structure="delayed"\}/  {print $2}')
+            if [ "$pending" = "0" ] && [ "$inflight" = "0" ] && [ "$delayed" = "0" ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          metrics=$(curl -sf localhost:2112/metrics)
+          echo "$metrics" | grep '^jobqueue_' | grep -v '_bucket'
+
+          value() { echo "$metrics" | awk -F' ' "/^$1/ {s+=\$2} END {print s+0}"; }
+
+          success=$(value 'jobqueue_jobs_processed_total\{result="success"\}')
+          dlq=$(value 'jobqueue_depth\{structure="dlq"\}')
+          stale=$(value 'jobqueue_stale_results_discarded_total')
+          poisoned=$(value 'jobqueue_jobs_poisoned_total')
+          pending=$(value 'jobqueue_depth\{structure="pending"\}')
+          inflight=$(value 'jobqueue_depth\{structure="inflight"\}')
+
+          echo "success=$success dlq=$dlq stale=$stale poisoned=$poisoned pending=$pending inflight=$inflight"
+
+          # Conservation: every one of the 100 enqueued jobs either succeeded
+          # or was buried. This is the property the whole project is about.
+          total=$((success + dlq))
+          if [ "$total" -ne 100 ]; then
+            echo "FAIL: $success succeeded + $dlq buried = $total, expected 100 - a job was lost or duplicated"
+            exit 1
+          fi
+
+          # No healthy worker should ever lose the ownership handshake.
+          if [ "$stale" != "0" ]; then
+            echo "FAIL: stale_results_discarded_total = $stale, expected 0"
+            exit 1
+          fi
+
+          if [ "$poisoned" != "0" ]; then
+            echo "FAIL: poisoned = $poisoned, expected 0"
+            exit 1
+          fi
+
+          if [ "$pending" != "0" ] || [ "$inflight" != "0" ]; then
+            echo "FAIL: queue did not drain (pending=$pending inflight=$inflight)"
+            exit 1
+          fi
+
+          echo "PASS: 100 jobs conserved, no stale results, queue drained clean"

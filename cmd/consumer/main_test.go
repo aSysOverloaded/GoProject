@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -33,15 +35,51 @@ func newTestRedis(t *testing.T) *redis.Client {
 func useFastTimings(t *testing.T) {
 	t.Helper()
 	oldVis, oldHB, oldSweep, oldBlock := visTimeout, heartbeatTick, sweepTick, blockTimeout
+	oldBase, oldMax, oldPromote := baseRetryDelay, maxRetryDelay, promoteTick
+
 	visTimeout = 150 * time.Millisecond
 	heartbeatTick = 40 * time.Millisecond
 	sweepTick = 25 * time.Millisecond
 	// Redis rejects sub-second blocking timeouts, so this one stays at 1s.
 	blockTimeout = 1 * time.Second
+	baseRetryDelay = 10 * time.Millisecond
+	maxRetryDelay = 50 * time.Millisecond
+	promoteTick = 10 * time.Millisecond
+
 	t.Cleanup(func() {
 		visTimeout, heartbeatTick, sweepTick, blockTimeout = oldVis, oldHB, oldSweep, oldBlock
+		baseRetryDelay, maxRetryDelay, promoteTick = oldBase, oldMax, oldPromote
 	})
 }
+
+// delayedContents returns the jobs currently waiting out their retry backoff.
+func delayedContents(t *testing.T, rdb *redis.Client) []string {
+	t.Helper()
+	out, err := rdb.ZRange(context.Background(), delayedKey, 0, -1).Result()
+	if err != nil {
+		t.Fatalf("ZRANGE %s: %v", delayedKey, err)
+	}
+	return out
+}
+
+// drainDelayed promotes every delayed job onto the main queue, waiting for
+// backoffs to elapse. Tests that care about the eventual queue state use this
+// instead of running a promoter goroutine.
+func drainDelayed(t *testing.T, rdb *redis.Client) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(delayedContents(t, rdb)) == 0 {
+			return
+		}
+		promoteDue(context.Background(), rdb)
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("delayed set did not drain within 2s: %v", delayedContents(t, rdb))
+}
+
+// errFail is a generic retryable handler failure.
+var errFail = errors.New("handler failed")
 
 func mustMarshal(t *testing.T, job Job) string {
 	t.Helper()
@@ -120,9 +158,16 @@ func TestCrashBetweenPopAndClaimDoesNotLoseJob(t *testing.T) {
 
 	startSweeper(t, rdb)
 
-	waitFor(t, 3*time.Second, "the orphaned job to be requeued", func() bool {
-		return len(queueContents(t, rdb, queueKey)) == 1
+	// The reclaimed job goes into the delayed set to serve its backoff, then
+	// the promoter returns it to the queue.
+	waitFor(t, 3*time.Second, "the orphaned job to be scheduled for retry", func() bool {
+		return len(delayedContents(t, rdb)) == 1
 	})
+	drainDelayed(t, rdb)
+
+	if got := queueContents(t, rdb, queueKey); len(got) != 1 {
+		t.Fatalf("expected 1 job back on the queue, got %d", len(got))
+	}
 
 	var recovered Job
 	if err := json.Unmarshal([]byte(queueContents(t, rdb, queueKey)[0]), &recovered); err != nil {
@@ -171,6 +216,9 @@ func TestHeartbeatKeepsSlowWorkerFromBeingReclaimed(t *testing.T) {
 	if got := queueContents(t, rdb, queueKey); len(got) != 0 {
 		t.Fatalf("sweeper requeued a job that was still being worked on: %v", got)
 	}
+	if got := delayedContents(t, rdb); len(got) != 0 {
+		t.Fatalf("sweeper scheduled a retry for a job still being worked on: %v", got)
+	}
 	if got := queueContents(t, rdb, inflightKey); len(got) != 1 {
 		t.Fatalf("expected the job to still be in flight, got %d entries", len(got))
 	}
@@ -179,7 +227,7 @@ func TestHeartbeatKeepsSlowWorkerFromBeingReclaimed(t *testing.T) {
 	// otherwise we would have traded a false positive for a stuck job.
 	stopHeartbeat()
 	waitFor(t, 3*time.Second, "the job to be reclaimed after the heartbeat stops", func() bool {
-		return len(queueContents(t, rdb, queueKey)) == 1
+		return len(delayedContents(t, rdb)) == 1
 	})
 }
 
@@ -204,16 +252,21 @@ func TestSettleDiscardsResultAfterSweeperReclaim(t *testing.T) {
 		t.Fatalf("claim job: %v", err)
 	}
 
-	// The sweeper reclaims and requeues: that is one requeue.
+	// The sweeper reclaims and schedules a retry: that is one requeue.
 	reclaim(ctx, rdb, jobJSON)
-	if got := queueContents(t, rdb, queueKey); len(got) != 1 {
-		t.Fatalf("expected sweeper to requeue exactly 1 job, got %d", len(got))
+	if got := delayedContents(t, rdb); len(got) != 1 {
+		t.Fatalf("expected sweeper to schedule exactly 1 retry, got %d", len(got))
 	}
 
 	// The original worker now finishes and reports a failure. It lost the
 	// ownership handshake, so it must not requeue anything.
-	settle(1, rdb, job, jobJSON, false, 10*time.Millisecond)
+	settle(1, rdb, job, jobJSON, errFail, 10*time.Millisecond)
 
+	if got := delayedContents(t, rdb); len(got) != 1 {
+		t.Errorf("job was requeued twice: delayed set holds %d entries, want 1 (%v)", len(got), got)
+	}
+
+	drainDelayed(t, rdb)
 	if got := queueContents(t, rdb, queueKey); len(got) != 1 {
 		t.Errorf("job was requeued twice: queue holds %d entries, want 1 (%v)", len(got), got)
 	}
@@ -243,7 +296,7 @@ func TestSettleSuccessLeavesNoResidue(t *testing.T) {
 		t.Fatalf("claim job: %v", err)
 	}
 
-	settle(1, rdb, job, jobJSON, true, 10*time.Millisecond)
+	settle(1, rdb, job, jobJSON, nil, 10*time.Millisecond)
 
 	if got := queueContents(t, rdb, inflightKey); len(got) != 0 {
 		t.Errorf("in-flight list not cleared: %v", got)
@@ -262,23 +315,238 @@ func TestSettleSuccessLeavesNoResidue(t *testing.T) {
 // TestRetryOrBuryRoutesToDLQAtMaxAttempts pins the retry policy that both the
 // worker and the sweeper now share.
 func TestRetryOrBuryRoutesToDLQAtMaxAttempts(t *testing.T) {
+	useFastTimings(t)
 	rdb := newTestRedis(t)
 	ctx := context.Background()
+	worker1 := actor{label: "worker", name: "Worker 1"}
 
-	retryOrBury(ctx, rdb, actor{label: "worker", name: "Worker 1"}, Job{ID: "job-retry", Attempts: maxAttempts - 1})
-	if got := queueContents(t, rdb, queueKey); len(got) != 1 {
-		t.Errorf("job below the attempt limit should be requeued, queue has %d entries", len(got))
+	retryOrBury(ctx, rdb, worker1, Job{ID: "job-retry", Attempts: maxAttempts - 1}, errFail)
+	if got := delayedContents(t, rdb); len(got) != 1 {
+		t.Errorf("job below the attempt limit should be scheduled for retry, delayed set has %d entries", len(got))
 	}
 	if got := queueContents(t, rdb, dlqKey); len(got) != 0 {
 		t.Errorf("job below the attempt limit should not be buried, DLQ has %d entries", len(got))
 	}
 
-	retryOrBury(ctx, rdb, actor{label: "worker", name: "Worker 1"}, Job{ID: "job-dead", Attempts: maxAttempts})
+	retryOrBury(ctx, rdb, worker1, Job{ID: "job-dead", Attempts: maxAttempts}, errFail)
 	if got := queueContents(t, rdb, dlqKey); len(got) != 1 {
 		t.Errorf("job at the attempt limit should go to the DLQ, DLQ has %d entries", len(got))
 	}
-	if got := queueContents(t, rdb, queueKey); len(got) != 1 {
-		t.Errorf("job at the attempt limit should not be requeued, queue has %d entries", len(got))
+	if got := delayedContents(t, rdb); len(got) != 1 {
+		t.Errorf("job at the attempt limit should not be retried, delayed set has %d entries", len(got))
+	}
+}
+
+// TestPermanentErrorSkipsRetries checks that a handler reporting ErrPermanent
+// is buried immediately instead of burning its whole retry budget and the
+// backoff waits on an outcome that cannot change.
+func TestPermanentErrorSkipsRetries(t *testing.T) {
+	useFastTimings(t)
+	rdb := newTestRedis(t)
+	ctx := context.Background()
+
+	// Attempt 1 of 3: normally this would be retried.
+	permanent := fmt.Errorf("bad payload: %w", ErrPermanent)
+	retryOrBury(ctx, rdb, actor{label: "worker", name: "Worker 1"},
+		Job{ID: "job-poisonous", Attempts: 1}, permanent)
+
+	if got := delayedContents(t, rdb); len(got) != 0 {
+		t.Errorf("permanent failure should not be retried, delayed set has %d entries: %v", len(got), got)
+	}
+	if got := queueContents(t, rdb, dlqKey); len(got) != 1 {
+		t.Fatalf("permanent failure should go straight to the DLQ, DLQ has %d entries", len(got))
+	}
+}
+
+// TestBackoffGrowsAndIsCapped covers the shape of the retry delay.
+func TestBackoffGrowsAndIsCapped(t *testing.T) {
+	oldBase, oldMax := baseRetryDelay, maxRetryDelay
+	baseRetryDelay = 1 * time.Second
+	maxRetryDelay = 10 * time.Second
+	t.Cleanup(func() { baseRetryDelay, maxRetryDelay = oldBase, oldMax })
+
+	// Jitter keeps each delay within [50%, 100%] of the nominal value, so the
+	// assertions are on bounds rather than exact numbers.
+	for _, tc := range []struct {
+		attempt int
+		nominal time.Duration
+	}{
+		{1, 1 * time.Second},
+		{2, 2 * time.Second},
+		{3, 4 * time.Second},
+		{4, 8 * time.Second},
+		{5, 10 * time.Second}, // 16s, capped
+		{9, 10 * time.Second}, // would overflow without the cap
+	} {
+		for i := 0; i < 50; i++ {
+			got := backoffFor(tc.attempt)
+			if got < tc.nominal/2 || got > tc.nominal {
+				t.Fatalf("backoffFor(%d) = %v, want within [%v, %v]",
+					tc.attempt, got, tc.nominal/2, tc.nominal)
+			}
+		}
+	}
+
+	// Jitter must actually vary, otherwise a thundering herd survives.
+	seen := map[time.Duration]bool{}
+	for i := 0; i < 50; i++ {
+		seen[backoffFor(3)] = true
+	}
+	if len(seen) < 10 {
+		t.Errorf("backoff jitter produced only %d distinct values across 50 calls; retries would still be synchronised", len(seen))
+	}
+}
+
+// TestPromoterReturnsJobsWhenDue checks that delayed jobs are held until their
+// backoff elapses, then moved back exactly once.
+func TestPromoterReturnsJobsWhenDue(t *testing.T) {
+	useFastTimings(t)
+	rdb := newTestRedis(t)
+	ctx := context.Background()
+
+	ready := mustMarshal(t, Job{ID: "job-due"})
+	notYet := mustMarshal(t, Job{ID: "job-not-due"})
+
+	rdb.ZAdd(ctx, delayedKey, redis.Z{
+		Score:  float64(time.Now().Add(-time.Second).UnixMilli()),
+		Member: ready,
+	})
+	rdb.ZAdd(ctx, delayedKey, redis.Z{
+		Score:  float64(time.Now().Add(time.Hour).UnixMilli()),
+		Member: notYet,
+	})
+
+	if n := promoteDue(ctx, rdb); n != 1 {
+		t.Fatalf("promoteDue promoted %d jobs, want 1", n)
+	}
+
+	queued := queueContents(t, rdb, queueKey)
+	if len(queued) != 1 || queued[0] != ready {
+		t.Errorf("queue = %v, want exactly the due job", queued)
+	}
+	if got := delayedContents(t, rdb); len(got) != 1 || got[0] != notYet {
+		t.Errorf("delayed set = %v, want only the not-yet-due job", got)
+	}
+
+	// A second pass must not promote the same job again.
+	if n := promoteDue(ctx, rdb); n != 0 {
+		t.Errorf("second promoteDue promoted %d jobs, want 0", n)
+	}
+}
+
+// TestUnparseablePayloadIsQuarantined covers what used to be silent data loss:
+// a payload that cannot be parsed was deleted outright.
+func TestUnparseablePayloadIsQuarantined(t *testing.T) {
+	useFastTimings(t)
+	rdb := newTestRedis(t)
+	ctx := context.Background()
+
+	garbage := "{not valid json at all"
+	rdb.RPush(ctx, inflightKey, garbage)
+
+	handleJob(1, rdb, garbage)
+
+	poisoned := queueContents(t, rdb, poisonKey)
+	if len(poisoned) != 1 || poisoned[0] != garbage {
+		t.Errorf("poison list = %v, want the raw payload preserved", poisoned)
+	}
+	if got := queueContents(t, rdb, inflightKey); len(got) != 0 {
+		t.Errorf("quarantined payload left in the in-flight list: %v", got)
+	}
+	if got := queueContents(t, rdb, dlqKey); len(got) != 0 {
+		t.Errorf("unparseable payload must not pollute the DLQ: %v", got)
+	}
+}
+
+// TestHandlerRegistryDispatchesByType checks that job types reach their own
+// handler, and that an unknown type is a permanent failure rather than three
+// doomed attempts.
+func TestHandlerRegistryDispatchesByType(t *testing.T) {
+	var ran string
+	register(JobHandler{
+		Name:    "test-echo",
+		Timeout: time.Second,
+		Run: func(ctx context.Context, job Job) error {
+			ran = job.Payload
+			return nil
+		},
+	})
+	t.Cleanup(func() { delete(handlers, "test-echo") })
+
+	if err, _ := dispatch(Job{ID: "a", Type: "test-echo", Payload: "hello"}); err != nil {
+		t.Fatalf("dispatch returned %v, want nil", err)
+	}
+	if ran != "hello" {
+		t.Errorf("handler saw payload %q, want %q", ran, "hello")
+	}
+
+	err, _ := dispatch(Job{ID: "b", Type: "no-such-type"})
+	if !errors.Is(err, ErrPermanent) {
+		t.Errorf("unknown job type gave %v, want it to wrap ErrPermanent", err)
+	}
+}
+
+// TestHandlerTimeoutIsEnforced checks the per-type timeout actually reaches
+// the handler's context.
+func TestHandlerTimeoutIsEnforced(t *testing.T) {
+	register(JobHandler{
+		Name:    "test-slow",
+		Timeout: 50 * time.Millisecond,
+		Run: func(ctx context.Context, job Job) error {
+			select {
+			case <-time.After(5 * time.Second):
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	})
+	t.Cleanup(func() { delete(handlers, "test-slow") })
+
+	start := time.Now()
+	err, took := dispatch(Job{ID: "c", Type: "test-slow"})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("dispatch error = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("handler ran for %v; the timeout was not applied", elapsed)
+	}
+	if took < 40*time.Millisecond {
+		t.Errorf("reported duration %v is implausibly short", took)
+	}
+}
+
+// TestPerTypeMaxAttempts checks a handler can override the global retry budget.
+func TestPerTypeMaxAttempts(t *testing.T) {
+	register(JobHandler{
+		Name:        "test-once",
+		Timeout:     time.Second,
+		MaxAttempts: 1,
+		Run:         func(ctx context.Context, job Job) error { return nil },
+	})
+	t.Cleanup(func() { delete(handlers, "test-once") })
+
+	if got := attemptsFor("test-once"); got != 1 {
+		t.Errorf("attemptsFor(test-once) = %d, want 1", got)
+	}
+	if got := attemptsFor(""); got != maxAttempts {
+		t.Errorf("attemptsFor(default) = %d, want the global %d", got, maxAttempts)
+	}
+}
+
+// TestWaitTimeout covers the shutdown deadline helper.
+func TestWaitTimeout(t *testing.T) {
+	var quick sync.WaitGroup
+	quick.Add(1)
+	go func() { time.Sleep(10 * time.Millisecond); quick.Done() }()
+	if !waitTimeout(&quick, time.Second) {
+		t.Error("waitTimeout reported a timeout for a group that finished in time")
+	}
+
+	var stuck sync.WaitGroup
+	stuck.Add(1) // never Done
+	if waitTimeout(&stuck, 50*time.Millisecond) {
+		t.Error("waitTimeout reported success for a group that never finished")
 	}
 }
 
@@ -294,7 +562,8 @@ func TestMetricsTrackJobOutcomes(t *testing.T) {
 		"success":  testutil.ToFloat64(jobsProcessed.WithLabelValues("success")),
 		"failure":  testutil.ToFloat64(jobsProcessed.WithLabelValues("failure")),
 		"retried":  testutil.ToFloat64(jobsRetried.WithLabelValues("worker")),
-		"buried":   testutil.ToFloat64(jobsBuried.WithLabelValues("worker")),
+		"buried":   testutil.ToFloat64(jobsBuried.WithLabelValues("worker", "exhausted")),
+		"perm":     testutil.ToFloat64(jobsBuried.WithLabelValues("worker", "permanent")),
 		"stale":    testutil.ToFloat64(staleResults),
 		"recovers": testutil.ToFloat64(jobsRecovered),
 	}
@@ -305,19 +574,26 @@ func TestMetricsTrackJobOutcomes(t *testing.T) {
 	okJSON := mustMarshal(t, ok)
 	rdb.RPush(ctx, inflightKey, okJSON)
 	rdb.ZAdd(ctx, deadlinesKey, redis.Z{Score: deadlineFrom(time.Now()), Member: okJSON})
-	settle(1, rdb, ok, okJSON, true, 300*time.Millisecond)
+	settle(1, rdb, ok, okJSON, nil, 300*time.Millisecond)
 
 	// A job that fails and still has attempts left.
 	bad := Job{ID: "m-bad"}
 	badJSON := mustMarshal(t, bad)
 	rdb.RPush(ctx, inflightKey, badJSON)
 	rdb.ZAdd(ctx, deadlinesKey, redis.Z{Score: deadlineFrom(time.Now()), Member: badJSON})
-	settle(1, rdb, bad, badJSON, false, 400*time.Millisecond)
+	settle(1, rdb, bad, badJSON, errFail, 400*time.Millisecond)
+
+	// A job whose handler reported a permanent failure: buried on the spot.
+	doomed := Job{ID: "m-doomed"}
+	doomedJSON := mustMarshal(t, doomed)
+	rdb.RPush(ctx, inflightKey, doomedJSON)
+	rdb.ZAdd(ctx, deadlinesKey, redis.Z{Score: deadlineFrom(time.Now()), Member: doomedJSON})
+	settle(1, rdb, doomed, doomedJSON, fmt.Errorf("nope: %w", ErrPermanent), 50*time.Millisecond)
 
 	// A worker reporting on a job the sweeper already took.
 	lost := Job{ID: "m-lost"}
 	lostJSON := mustMarshal(t, lost)
-	settle(1, rdb, lost, lostJSON, true, 100*time.Millisecond)
+	settle(1, rdb, lost, lostJSON, nil, 100*time.Millisecond)
 
 	// A sweeper reclaim.
 	orphan := Job{ID: "m-orphan"}
@@ -335,9 +611,10 @@ func TestMetricsTrackJobOutcomes(t *testing.T) {
 		want float64
 	}{
 		{"jobs_processed_total{result=success}", delta("success", testutil.ToFloat64(jobsProcessed.WithLabelValues("success"))), 1},
-		{"jobs_processed_total{result=failure}", delta("failure", testutil.ToFloat64(jobsProcessed.WithLabelValues("failure"))), 1},
+		{"jobs_processed_total{result=failure}", delta("failure", testutil.ToFloat64(jobsProcessed.WithLabelValues("failure"))), 2},
 		{"jobs_retried_total{source=worker}", delta("retried", testutil.ToFloat64(jobsRetried.WithLabelValues("worker"))), 1},
-		{"jobs_dlq_total{source=worker}", delta("buried", testutil.ToFloat64(jobsBuried.WithLabelValues("worker"))), 0},
+		{"jobs_dlq_total{source=worker,reason=exhausted}", delta("buried", testutil.ToFloat64(jobsBuried.WithLabelValues("worker", "exhausted"))), 0},
+		{"jobs_dlq_total{source=worker,reason=permanent}", delta("perm", testutil.ToFloat64(jobsBuried.WithLabelValues("worker", "permanent"))), 1},
 		{"stale_results_discarded_total", delta("stale", testutil.ToFloat64(staleResults)), 1},
 		{"jobs_recovered_total", delta("recovers", testutil.ToFloat64(jobsRecovered)), 1},
 	}
@@ -375,7 +652,15 @@ func TestMetricsEndpointServesRegistry(t *testing.T) {
 		"jobqueue_jobs_recovered_total",
 		"jobqueue_stale_results_discarded_total",
 		"jobqueue_job_duration_seconds_bucket",
-		"jobqueue_depth",
+		"jobqueue_jobs_poisoned_total",
+		"jobqueue_jobs_promoted_total",
+		"jobqueue_retry_delay_seconds_bucket",
+		"jobqueue_forced_shutdowns_total",
+		`jobqueue_depth{structure="delayed"}`,
+		`jobqueue_depth{structure="poison"}`,
+		`jobqueue_jobs_dlq_total{reason="permanent"`,
+		// Registered automatically by client_golang, no code required.
+		"go_goroutines",
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("/metrics output is missing %q", want)
