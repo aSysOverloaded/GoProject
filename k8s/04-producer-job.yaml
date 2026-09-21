@@ -1,0 +1,49 @@
+# The producer enqueues a batch and exits, which is a Job rather than a
+# Deployment. Kubernetes has a kind for run-to-completion work; using a
+# Deployment here would restart it forever.
+#
+#   kubectl create job --from=cronjob/... is for scheduled runs; for a
+#   one-off, delete and re-apply, or:
+#   kubectl -n jobqueue delete job jobqueue-producer --ignore-not-found
+#   kubectl apply -f k8s/04-producer-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: jobqueue-producer
+  namespace: jobqueue
+spec:
+  # If the producer itself fails, retry the whole batch a couple of times.
+  backoffLimit: 2
+  # Clean the finished Job up automatically after 10 minutes.
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: jobqueue-producer
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: producer
+          image: jobqueue:dev
+          imagePullPolicy: IfNotPresent
+          # Same image as the consumer, different binary.
+          command: ["/producer"]
+          envFrom:
+            - configMapRef:
+                name: jobqueue-config
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

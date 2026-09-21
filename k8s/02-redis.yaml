@@ -1,0 +1,84 @@
+# Redis as a StatefulSet rather than a Deployment. The queue is state: it
+# needs a stable identity and a volume that survives rescheduling. A
+# Deployment would give neither, and a restarted pod would come back with an
+# empty queue.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: jobqueue
+  labels:
+    app.kubernetes.io/name: redis
+spec:
+  # Headless: DNS resolves straight to the pod IP rather than to a virtual
+  # service IP. With one replica it makes little difference, but it is what
+  # a future replica set would need in order to address each member
+  # individually (redis-0, redis-1, ...).
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: jobqueue
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          # appendonly: the whole project is about not losing jobs, so the
+          # queue must survive a pod restart.
+          args: ["redis-server", "--appendonly", "yes", "--dir", "/data"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

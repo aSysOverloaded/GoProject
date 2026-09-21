@@ -60,6 +60,16 @@ func scheduleRetry(ctx context.Context, rdb *redis.Client, who actor, job Job, j
 
 	jobsRetried.WithLabelValues(who.label).Inc()
 	retryDelay.Observe(delay.Seconds())
+
+	events.publish(JobEvent{
+		JobID:      job.ID,
+		JobType:    job.Type,
+		Event:      EventRetried,
+		Attempt:    job.Attempts,
+		DurationMS: delay.Milliseconds(),
+		Worker:     who.name,
+		Reason:     "scheduled for retry after backoff",
+	})
 	return nil
 }
 

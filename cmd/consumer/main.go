@@ -66,6 +66,10 @@ func main() {
 
 	metricsSrv := serveMetrics(cfg.MetricsAddr)
 
+	// Optional: with KAFKA_BROKERS unset this is nil and every publish call
+	// is a no-op, so the queue runs exactly as before.
+	events = newPublisher()
+
 	wg.Add(1)
 	go pollQueueDepths(runCtx, rdb, &wg)
 
@@ -106,10 +110,15 @@ func main() {
 		shutdownsForced.Inc()
 	}
 
-	// Stop serving metrics last, so a final scrape can still catch the
-	// counters from the jobs we just drained.
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelShutdown()
+
+	// Flush buffered events before exiting, otherwise a deploy silently
+	// truncates the audit trail.
+	events.close(shutdownCtx)
+
+	// Stop serving metrics last, so a final scrape can still catch the
+	// counters from the jobs we just drained.
 	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("\033[31m[Metrics] Error during shutdown: %v\033[0m", err)
 	}
@@ -225,6 +234,14 @@ func handleJob(workerID int, rdb *redis.Client, jobJSON string) {
 	log.Printf("\033[34m[Worker %d] ➡️ Processing Job %s (type %q) - Attempt %d/%d\033[0m",
 		workerID, job.ID, job.Type, job.Attempts+1, attemptsFor(job.Type))
 
+	events.publish(JobEvent{
+		JobID:   job.ID,
+		JobType: job.Type,
+		Event:   EventStarted,
+		Attempt: job.Attempts + 1,
+		Worker:  fmt.Sprintf("worker-%d", workerID),
+	})
+
 	claimCtx, claimCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	err := rdb.ZAdd(claimCtx, deadlinesKey, redis.Z{
 		Score:  deadlineFrom(time.Now()),
@@ -265,6 +282,12 @@ func quarantine(rdb *redis.Client, rawPayload string) {
 	rdb.LRem(ctx, inflightKey, 1, rawPayload)
 	rdb.ZRem(ctx, deadlinesKey, rawPayload)
 	jobsPoisoned.Inc()
+
+	events.publish(JobEvent{
+		JobID:  "unknown",
+		Event:  EventPoisoned,
+		Reason: "payload could not be parsed as a job",
+	})
 }
 
 // heartbeat pushes the job's deadline further out at a steady tick. It only
@@ -314,6 +337,14 @@ func settle(workerID int, rdb *redis.Client, job Job, jobJSON string, runErr err
 	if owned == 0 {
 		staleResults.Inc()
 		log.Printf("\033[1;33m[Worker %d] ⚠️ Job %s was reclaimed by the sweeper mid-flight. Discarding result.\033[0m", workerID, job.ID)
+		events.publish(JobEvent{
+			JobID:   job.ID,
+			JobType: job.Type,
+			Event:   EventDiscarded,
+			Attempt: job.Attempts + 1,
+			Worker:  fmt.Sprintf("worker-%d", workerID),
+			Reason:  "lost ownership handshake to sweeper",
+		})
 		return
 	}
 
@@ -323,9 +354,19 @@ func settle(workerID int, rdb *redis.Client, job Job, jobJSON string, runErr err
 
 	jobDuration.Observe(workDuration.Seconds())
 
+	workerName := fmt.Sprintf("worker-%d", workerID)
+
 	if runErr == nil {
 		jobsProcessed.WithLabelValues("success").Inc()
 		log.Printf("\033[32m[Worker %d] ✅ Job %s completed successfully in %v\033[0m", workerID, job.ID, workDuration.Round(time.Millisecond))
+		events.publish(JobEvent{
+			JobID:      job.ID,
+			JobType:    job.Type,
+			Event:      EventSucceeded,
+			Attempt:    job.Attempts + 1,
+			DurationMS: workDuration.Milliseconds(),
+			Worker:     workerName,
+		})
 		return
 	}
 
@@ -333,6 +374,16 @@ func settle(workerID int, rdb *redis.Client, job Job, jobJSON string, runErr err
 	job.Attempts++
 	log.Printf("\033[31m[Worker %d] ❌ Job %s FAILED (Attempt %d/%d): %v\033[0m",
 		workerID, job.ID, job.Attempts, attemptsFor(job.Type), runErr)
+
+	events.publish(JobEvent{
+		JobID:      job.ID,
+		JobType:    job.Type,
+		Event:      EventFailed,
+		Attempt:    job.Attempts,
+		DurationMS: workDuration.Milliseconds(),
+		Error:      runErr.Error(),
+		Worker:     workerName,
+	})
 
 	retryOrBury(ctx, rdb, actor{label: "worker", name: fmt.Sprintf("Worker %d", workerID)}, job, runErr)
 }
@@ -385,6 +436,19 @@ func retryOrBury(ctx context.Context, rdb *redis.Client, who actor, job Job, run
 		reason = "permanent"
 	}
 	jobsBuried.WithLabelValues(who.label, reason).Inc()
+
+	buried := JobEvent{
+		JobID:   job.ID,
+		JobType: job.Type,
+		Event:   EventBuried,
+		Attempt: job.Attempts,
+		Worker:  who.name,
+		Reason:  reason,
+	}
+	if runErr != nil {
+		buried.Error = runErr.Error()
+	}
+	events.publish(buried)
 }
 
 // sweeper looks for jobs stranded in the in-flight list by a crashed worker.
@@ -479,6 +543,15 @@ func reclaim(ctx context.Context, rdb *redis.Client, jobJSON string) {
 	jobsRecovered.Inc()
 	job.Attempts++
 	log.Printf("\033[1;33m[Sweeper] ⚠️ Detected orphaned Job %s (Worker crashed). Reclaiming...\033[0m", job.ID)
+
+	events.publish(JobEvent{
+		JobID:   job.ID,
+		JobType: job.Type,
+		Event:   EventRecovered,
+		Attempt: job.Attempts,
+		Worker:  "sweeper",
+		Reason:  "owner stopped heartbeating",
+	})
 
 	dbCtx, dbCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer dbCancel()

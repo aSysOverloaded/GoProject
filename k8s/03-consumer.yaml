@@ -1,0 +1,136 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: jobqueue-consumer
+  namespace: jobqueue
+  labels:
+    app.kubernetes.io/name: jobqueue-consumer
+spec:
+  selector:
+    app.kubernetes.io/name: jobqueue-consumer
+  ports:
+    - name: metrics
+      port: 2112
+      targetPort: metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jobqueue-consumer
+  namespace: jobqueue
+  labels:
+    app.kubernetes.io/name: jobqueue-consumer
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jobqueue-consumer
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never take down more than one consumer at a time during a rollout.
+      # Consumers are stateful in flight: each holds jobs whose visibility
+      # timeout has not expired. Draining them one at a time keeps the
+      # sweeper's workload near zero during a deploy.
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: jobqueue-consumer
+      annotations:
+        # Picked up by a Prometheus configured with the standard
+        # kubernetes_sd_configs pod-scrape relabeling. With the Prometheus
+        # Operator you would use the ServiceMonitor in 06-monitoring.yaml
+        # instead.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "2112"
+        prometheus.io/path: "/metrics"
+    spec:
+      # THE important number. Kubernetes sends SIGTERM, waits this long, then
+      # SIGKILLs. It must exceed SHUTDOWN_TIMEOUT (25s) so the app's own
+      # graceful drain gets to finish first; the extra 5s covers process
+      # startup of the shutdown path and the final metrics scrape.
+      #
+      # Get this backwards and every rollout becomes an ungraceful kill -
+      # exactly the crash the sweeper exists to recover from, happening on
+      # purpose, several times per deploy.
+      terminationGracePeriodSeconds: 30
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: consumer
+          image: jobqueue:dev
+          # Local image, never pulled from a registry. Change to IfNotPresent
+          # or Always once you publish it somewhere.
+          imagePullPolicy: IfNotPresent
+
+          envFrom:
+            - configMapRef:
+                name: jobqueue-config
+          env:
+            # Surfaced in logs so you can tell which pod handled a job.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+          ports:
+            - name: metrics
+              containerPort: 2112
+
+          # Liveness: is the process wedged? Restart it if so. Deliberately
+          # generous - a consumer blocked on a slow Redis is not wedged, and
+          # restarting it would abandon in-flight jobs for no reason.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # Readiness: should this pod receive traffic? This workload pulls
+          # work rather than receiving it, so readiness matters mainly for
+          # rollouts - it is what makes the Deployment wait before moving on
+          # to the next pod.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+
+          # Startup probe keeps the liveness probe from firing during a slow
+          # first Redis connection.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 2
+            failureThreshold: 15
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              # No CPU limit on purpose: CFS throttling adds latency spikes,
+              # and a throttled worker is exactly the "slow but healthy"
+              # case that used to trigger false sweeper reclaims. Memory is
+              # capped because a leak should be killed, not tolerated.
+              memory: 256Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

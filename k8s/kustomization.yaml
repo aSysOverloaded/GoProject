@@ -1,0 +1,28 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: jobqueue
+
+resources:
+  - 00-namespace.yaml
+  - 01-config.yaml
+  - 02-redis.yaml
+  - 03-consumer.yaml
+  - 05-scaling.yaml
+  - 07-kafka.yaml
+  - 08-postgres.yaml
+  - 09-auditor.yaml
+  # 04-producer-job.yaml is left out on purpose: a Job is a one-off, and
+  # including it would make every `kubectl apply -k` try to recreate an
+  # immutable, already-completed object. Apply it directly when you want a
+  # batch.
+  #
+  # 06-monitoring.yaml is left out because ServiceMonitor and PrometheusRule
+  # are CRDs from the Prometheus Operator. Apply it once that is installed.
+
+commonLabels:
+  app.kubernetes.io/part-of: jobqueue
+
+images:
+  - name: jobqueue
+    newTag: dev

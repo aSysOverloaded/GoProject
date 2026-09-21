@@ -76,6 +76,20 @@ var (
 		Help: "Shutdowns that hit the deadline with jobs still running.",
 	})
 
+	// kafkaPublished counts lifecycle events written to the event stream.
+	kafkaPublished = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "jobqueue_events_published_total",
+		Help: "Job lifecycle events successfully published to Kafka.",
+	}, []string{"event"})
+
+	// kafkaPublishErrors counts events that could not be published. Because
+	// publishing is deliberately off the job hot path, this climbing means
+	// the audit trail has gaps - not that job processing is affected.
+	kafkaPublishErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "jobqueue_events_publish_errors_total",
+		Help: "Job lifecycle events that failed to publish. Job processing is unaffected; the audit trail is incomplete.",
+	})
+
 	// jobsRecovered counts sweeper reclaims. Before the heartbeat fix this
 	// climbed steadily even with no crashes, because slow-but-healthy
 	// workers were being declared dead. On a healthy system it should only

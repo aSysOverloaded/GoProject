@@ -1,0 +1,65 @@
+# The auditor consumes the Kafka event stream into Postgres.
+#
+# Replicas are capped by partition count: Kafka assigns each partition to
+# exactly one member of a consumer group, so with 3 partitions a 4th replica
+# would sit idle. That is a real difference from the consumer Deployment,
+# where Redis hands work to whichever worker asks first and there is no such
+# ceiling.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jobqueue-auditor
+  namespace: jobqueue
+  labels:
+    app.kubernetes.io/name: jobqueue-auditor
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jobqueue-auditor
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # One at a time. Every auditor pod that leaves or joins triggers a
+      # consumer group rebalance, during which consumption briefly stops.
+      maxUnavailable: 1
+      maxSurge: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: jobqueue-auditor
+    spec:
+      # Must exceed the Kafka session timeout so a shutting-down pod can
+      # leave the group cleanly instead of being timed out of it.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: auditor
+          image: jobqueue:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/auditor"]
+          env:
+            - name: KAFKA_BROKERS
+              value: "kafka-0.kafka.jobqueue.svc.cluster.local:9092"
+            - name: KAFKA_TOPIC
+              value: "job-events"
+            - name: KAFKA_GROUP
+              value: "job-auditor"
+          envFrom:
+            - secretRef:
+                name: postgres-credentials
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

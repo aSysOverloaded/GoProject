@@ -1,0 +1,114 @@
+# ServiceMonitor is the Prometheus Operator's way of declaring a scrape
+# target: instead of editing prometheus.yml, you create an object and the
+# operator regenerates the config. Monitoring becomes a property of the
+# service rather than a central file everyone has to edit.
+#
+# REQUIRES the Prometheus Operator (kube-prometheus-stack). Without it this
+# CRD does not exist and `kubectl apply` on this file fails - which is why
+# it is excluded from kustomization.yaml by default. The pod annotations in
+# 03-consumer.yaml cover the plain-Prometheus case.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: jobqueue-consumer
+  namespace: jobqueue
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jobqueue-consumer
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 5s
+      scrapeTimeout: 4s
+---
+# The alerts the metrics were built for. Prometheus evaluates these and hands
+# firing alerts to Alertmanager.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: jobqueue
+  namespace: jobqueue
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: jobqueue.rules
+      rules:
+        - alert: JobQueueConsumerDown
+          expr: up{job=~".*jobqueue.*"} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Job queue consumer is not being scraped"
+            description: "No successful scrape for 1m. Either the pod is down or the metrics endpoint is wedged."
+
+        # The visibility-timeout race, as an alert. This counter should
+        # never move. If it does, workers are outliving their lease and the
+        # sweeper is reclaiming live jobs.
+        - alert: JobQueueStaleResults
+          expr: increase(jobqueue_stale_results_discarded_total[5m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Workers are losing the ownership handshake"
+            description: >-
+              A worker finished a job the sweeper had already reclaimed.
+              Raise VISIBILITY_TIMEOUT or lower HEARTBEAT_INTERVAL.
+
+        # Sweeper reclaims should track pod restarts, not run continuously.
+        - alert: JobQueueExcessiveRecovery
+          expr: rate(jobqueue_jobs_recovered_total[5m]) > 0.1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Sweeper is reclaiming jobs continuously"
+            description: >-
+              Sustained reclaims without pod restarts means healthy workers
+              are being misclassified as dead.
+
+        - alert: JobQueueBacklogGrowing
+          expr: |
+            jobqueue_depth{structure="pending"} > 500
+            and
+            deriv(jobqueue_depth{structure="pending"}[10m]) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Queue backlog is large and still growing"
+            description: "Arrival rate exceeds service rate. Scale consumers or investigate slow handlers."
+
+        - alert: JobQueueDLQGrowing
+          expr: increase(jobqueue_jobs_dlq_total[15m]) > 10
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Jobs are being buried in the dead letter queue"
+            description: "{{ $value }} jobs buried in 15m. Check reason label: 'permanent' suggests bad payloads, 'exhausted' a flaky dependency."
+
+        - alert: JobQueuePoisonMessages
+          expr: increase(jobqueue_jobs_poisoned_total[15m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Unparseable payloads are reaching the queue"
+            description: "Something is writing malformed data. Inspect the jobs:poison list."
+
+        - alert: JobQueueForcedShutdown
+          expr: increase(jobqueue_forced_shutdowns_total[1h]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "A consumer hit its shutdown deadline with work in flight"
+            description: >-
+              A handler is ignoring its context, or SHUTDOWN_TIMEOUT is too
+              short for the slowest job.

@@ -1,0 +1,16 @@
+# Keep the build context small and avoid baking local state into the image.
+.git
+.github
+.env
+*.exe
+*.out
+
+# Local-only notes
+interview_prep.md
+interview_deep_dive.md
+
+# Not needed to compile
+k8s/
+monitoring/
+docker-compose.yml
+MarketingAgent/

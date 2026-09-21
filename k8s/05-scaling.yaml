@@ -1,0 +1,77 @@
+# A PodDisruptionBudget stops voluntary disruptions - node drains, cluster
+# upgrades, descheduler evictions - from taking every consumer at once.
+#
+# Without it, a node drain can evict both replicas simultaneously. Nothing is
+# lost (the sweeper reclaims in-flight jobs after the visibility timeout) but
+# throughput drops to zero and every in-flight job is delayed by a full
+# visTimeout. The PDB turns that into a rolling drain.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: jobqueue-consumer
+  namespace: jobqueue
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jobqueue-consumer
+---
+# Autoscaling on queue depth rather than CPU.
+#
+# CPU is the wrong signal for this workload. A consumer blocked in BLMOVE
+# waiting for work uses almost no CPU, and one saturated with I/O-bound jobs
+# may not either. The real signal for "add more workers" is backlog:
+# jobqueue_depth{structure="pending"}.
+#
+# REQUIRES prometheus-adapter (or KEDA) to expose that Prometheus metric to
+# the Kubernetes custom/external metrics API. Applying this without one
+# leaves the HPA in an "unable to fetch metrics" state - it does no harm,
+# but it will not scale either.
+#
+#   helm install prometheus-adapter prometheus-community/prometheus-adapter \
+#     --set prometheus.url=http://prometheus.monitoring.svc
+#
+# KEDA is the lighter option for queue-driven scaling and has a native Redis
+# list scaler, which would read LLEN jobs:queue directly with no adapter and
+# no Prometheus in the path.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: jobqueue-consumer
+  namespace: jobqueue
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: jobqueue-consumer
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: jobqueue_depth
+          selector:
+            matchLabels:
+              structure: pending
+        target:
+          # Scale so there are roughly 30 queued jobs per consumer pod.
+          # Above that, add pods; below, remove them.
+          type: AverageValue
+          averageValue: "30"
+  behavior:
+    scaleUp:
+      # React quickly to a backlog.
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+    scaleDown:
+      # Shrink slowly. Every removed pod is a graceful drain, and flapping
+      # would mean constant drains for no throughput gain.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60

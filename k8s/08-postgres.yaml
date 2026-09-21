@@ -1,0 +1,123 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-credentials
+  namespace: jobqueue
+type: Opaque
+stringData:
+  # Demo credentials. Real clusters use an external secret store - Sealed
+  # Secrets, External Secrets Operator, or the cloud provider's manager -
+  # because a Kubernetes Secret is only base64-encoded, not encrypted, and
+  # anyone who can read the object can read the password.
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgres
+  POSTGRES_DB: jobqueue
+  DATABASE_URL: "postgres://postgres:postgres@postgres:5432/jobqueue?sslmode=disable"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-schema
+  namespace: jobqueue
+data:
+  # Kept in sync with schema.sql at the repo root. Generate with:
+  #   kubectl -n jobqueue create configmap postgres-schema \
+  #     --from-file=01-schema.sql=schema.sql --dry-run=client -o yaml
+  01-schema.sql: |
+    CREATE TABLE IF NOT EXISTS job_events (
+        event_id     TEXT PRIMARY KEY,
+        job_id       TEXT        NOT NULL,
+        job_type     TEXT        NOT NULL DEFAULT '',
+        event        TEXT        NOT NULL,
+        attempt      INTEGER     NOT NULL DEFAULT 0,
+        duration_ms  BIGINT,
+        error        TEXT,
+        reason       TEXT,
+        worker       TEXT,
+        host         TEXT,
+        occurred_at  TIMESTAMPTZ NOT NULL,
+        recorded_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        kafka_partition INTEGER,
+        kafka_offset    BIGINT
+    );
+    CREATE INDEX IF NOT EXISTS job_events_job_id_idx ON job_events (job_id, occurred_at);
+    CREATE INDEX IF NOT EXISTS job_events_event_time_idx ON job_events (event, occurred_at DESC);
+    CREATE INDEX IF NOT EXISTS job_events_type_idx ON job_events (job_type, event);
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: jobqueue
+spec:
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: jobqueue
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: postgres-credentials
+          env:
+            # The image refuses to initialise into a non-empty directory,
+            # and the mounted volume has a lost+found. A subdirectory avoids
+            # it - a classic first-run failure.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: schema
+              mountPath: /docker-entrypoint-initdb.d
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "jobqueue"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "jobqueue"]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+      volumes:
+        - name: schema
+          configMap:
+            name: postgres-schema
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
