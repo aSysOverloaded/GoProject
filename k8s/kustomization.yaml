@@ -20,8 +20,15 @@ resources:
   # 06-monitoring.yaml is left out because ServiceMonitor and PrometheusRule
   # are CRDs from the Prometheus Operator. Apply it once that is installed.
 
-commonLabels:
-  app.kubernetes.io/part-of: jobqueue
+# Not commonLabels: that also injects the label into every selector, and
+# selectors on Deployments and StatefulSets are immutable. Adding or changing
+# a common label later would then be rejected for every existing workload -
+# which is exactly what happened the first time this was applied over objects
+# created without it. includeSelectors: false keeps it on metadata only.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: jobqueue
+    includeSelectors: false
 
 images:
   - name: jobqueue
