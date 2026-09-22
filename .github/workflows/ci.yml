@@ -60,8 +60,8 @@ jobs:
     runs-on: ubuntu-latest
     services:
       # The unit tests use miniredis, which is a reimplementation of Redis
-      # rather than Redis itself. This job runs the same suite against the
-      # real server so a behavioural difference cannot hide.
+      # rather than Redis itself. This job runs the real consumer and producer
+      # against the real server, so a behavioural difference cannot hide.
       redis:
         image: redis:7-alpine
         ports:
@@ -80,82 +80,11 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # The same script you can run locally, so CI and a laptop check exactly
+      # the same thing. It waits on counters, not the sampled depth gauges:
+      # the earlier inline version read the gauges, was fooled by the sample
+      # taken at startup before any job existed, and failed on every run.
       - name: Smoke test against real Redis
         env:
           REDIS_URL: redis://localhost:6379/0
-          WORKER_COUNT: "4"
-          METRICS_ADDR: ":2112"
-          # Keep the run short: small backoffs, quick sweeps.
-          BASE_RETRY_DELAY: 50ms
-          MAX_RETRY_DELAY: 200ms
-          PROMOTE_INTERVAL: 100ms
-          SWEEP_INTERVAL: 200ms
-        run: |
-          set -euo pipefail
-
-          go build -o /tmp/consumer ./cmd/consumer
-          go build -o /tmp/producer ./cmd/producer
-
-          /tmp/consumer & CONSUMER_PID=$!
-          trap 'kill $CONSUMER_PID 2>/dev/null || true' EXIT
-
-          # Wait for the metrics endpoint to answer.
-          for i in $(seq 1 30); do
-            if curl -sf localhost:2112/healthz >/dev/null; then break; fi
-            sleep 1
-          done
-          curl -sf localhost:2112/healthz >/dev/null || { echo "consumer never became healthy"; exit 1; }
-
-          /tmp/producer
-
-          # Wait for the queue to drain: pending, in-flight and delayed all zero.
-          for i in $(seq 1 60); do
-            metrics=$(curl -sf localhost:2112/metrics)
-            pending=$(echo "$metrics"  | awk -F' ' '/^jobqueue_depth\{structure="pending"\}/  {print $2}')
-            inflight=$(echo "$metrics" | awk -F' ' '/^jobqueue_depth\{structure="inflight"\}/ {print $2}')
-            delayed=$(echo "$metrics"  | awk -F' ' '/^jobqueue_depth\{structure="delayed"\}/  {print $2}')
-            if [ "$pending" = "0" ] && [ "$inflight" = "0" ] && [ "$delayed" = "0" ]; then
-              break
-            fi
-            sleep 2
-          done
-
-          metrics=$(curl -sf localhost:2112/metrics)
-          echo "$metrics" | grep '^jobqueue_' | grep -v '_bucket'
-
-          value() { echo "$metrics" | awk -F' ' "/^$1/ {s+=\$2} END {print s+0}"; }
-
-          success=$(value 'jobqueue_jobs_processed_total\{result="success"\}')
-          dlq=$(value 'jobqueue_depth\{structure="dlq"\}')
-          stale=$(value 'jobqueue_stale_results_discarded_total')
-          poisoned=$(value 'jobqueue_jobs_poisoned_total')
-          pending=$(value 'jobqueue_depth\{structure="pending"\}')
-          inflight=$(value 'jobqueue_depth\{structure="inflight"\}')
-
-          echo "success=$success dlq=$dlq stale=$stale poisoned=$poisoned pending=$pending inflight=$inflight"
-
-          # Conservation: every one of the 100 enqueued jobs either succeeded
-          # or was buried. This is the property the whole project is about.
-          total=$((success + dlq))
-          if [ "$total" -ne 100 ]; then
-            echo "FAIL: $success succeeded + $dlq buried = $total, expected 100 - a job was lost or duplicated"
-            exit 1
-          fi
-
-          # No healthy worker should ever lose the ownership handshake.
-          if [ "$stale" != "0" ]; then
-            echo "FAIL: stale_results_discarded_total = $stale, expected 0"
-            exit 1
-          fi
-
-          if [ "$poisoned" != "0" ]; then
-            echo "FAIL: poisoned = $poisoned, expected 0"
-            exit 1
-          fi
-
-          if [ "$pending" != "0" ] || [ "$inflight" != "0" ]; then
-            echo "FAIL: queue did not drain (pending=$pending inflight=$inflight)"
-            exit 1
-          fi
-
-          echo "PASS: 100 jobs conserved, no stale results, queue drained clean"
+        run: bash scripts/smoke-test.sh

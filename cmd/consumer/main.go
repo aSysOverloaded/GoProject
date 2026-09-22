@@ -333,43 +333,108 @@ func heartbeat(ctx context.Context, workerID int, rdb *redis.Client, jobID, jobJ
 	}
 }
 
+// next is where a job goes when its current holder releases it.
+type next struct {
+	mode    string // "none" (done), "zadd" (retry set) or "lpush" (DLQ, poison)
+	key     string
+	payload string
+	score   float64
+}
+
+// releaseScript ends a holder's claim on a job and moves the job to its next
+// state, as ONE atomic step. Both the worker (settle) and the sweeper
+// (reclaim) release jobs through it.
+//
+//	KEYS[1] jobs:deadlines   KEYS[2] jobs:inflight   KEYS[3] destination
+//	ARGV[1] the member being released
+//	ARGV[2] "none" | "zadd" | "lpush"
+//	ARGV[3] payload for the destination   ARGV[4] score, for "zadd"
+//
+// The ZREM is the ownership handshake: Redis runs one command at a time, so
+// for a given job exactly one caller can get 1 back. Whoever gets 0 lost the
+// job to someone else, and nothing is changed.
+//
+// It used to be three or four separate commands, which left two holes. A
+// sweeper looking between the ZREM and the LREM saw an in-flight job with no
+// deadline and "adopted" it, re-creating a deadline for a job that had already
+// finished. And a failure after the job left the in-flight list but before
+// its retry or DLQ write landed lost the job outright. A Lua script runs to
+// completion with nothing interleaved, so neither can happen.
+var releaseScript = redis.NewScript(`
+if redis.call('ZREM', KEYS[1], ARGV[1]) == 0 then
+  return 0
+end
+redis.call('LREM', KEYS[2], 1, ARGV[1])
+if ARGV[2] == 'zadd' then
+  redis.call('ZADD', KEYS[3], ARGV[4], ARGV[3])
+elseif ARGV[2] == 'lpush' then
+  redis.call('LPUSH', KEYS[3], ARGV[3])
+end
+return 1
+`)
+
+// release runs releaseScript and reports whether the caller owned the job.
+func release(ctx context.Context, rdb *redis.Client, member string, to next) (bool, error) {
+	dest := to.key
+	if dest == "" {
+		dest = dlqKey // unused for "none", but the script always takes three keys
+	}
+	n, err := releaseScript.Run(ctx, rdb,
+		[]string{deadlinesKey, inflightKey, dest},
+		member, to.mode, to.payload, to.score,
+	).Int()
+	return n == 1, err
+}
+
 // settle records the outcome of a job the worker just finished. A nil runErr
 // means success.
 func settle(workerID int, rdb *redis.Client, job Job, jobJSON string, runErr error, workDuration time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	// ZREM is the ownership handshake. Exactly one of {this worker, the sweeper}
-	// can get 1 back for a given job. Getting 0 means the sweeper decided we
-	// were dead and already requeued the job, so our result is stale and we
-	// must drop it - requeueing here is what used to duplicate the job and
-	// inflate its attempt counter.
-	owned, err := rdb.ZRem(ctx, deadlinesKey, jobJSON).Result()
+	workerName := fmt.Sprintf("worker-%d", workerID)
+	attempt := job.Attempts + 1 // the attempt that just ran
+
+	// Decide the outcome before touching Redis, so that releasing the job and
+	// moving it on is a single atomic transition.
+	to := next{mode: "none"}
+	var plan failurePlan
+	if runErr != nil {
+		job.Attempts++
+		p, err := planFailure(job, runErr)
+		if err != nil {
+			// Leave the job alone: its claim expires and the sweeper retries
+			// it, rather than risk losing it.
+			log.Printf("\033[31m[Worker %d] Error planning retry for Job %s: %v\033[0m", workerID, job.ID, err)
+			return
+		}
+		plan, to = p, p.to
+	}
+
+	owned, err := release(ctx, rdb, jobJSON, to)
 	if err != nil {
+		// Nothing changed. The claim expires and the sweeper takes over.
 		log.Printf("\033[31m[Worker %d] Error releasing Job %s: %v\033[0m", workerID, job.ID, err)
 		return
 	}
-	if owned == 0 {
+	if !owned {
+		// The sweeper decided this worker was dead and already moved the job
+		// on, so this result is stale and must be dropped - acting on it is
+		// what used to requeue the job twice and inflate its attempt counter.
 		staleResults.Inc()
 		log.Printf("\033[1;33m[Worker %d] ⚠️ Job %s was reclaimed by the sweeper mid-flight. Discarding result.\033[0m", workerID, job.ID)
 		events.publish(JobEvent{
 			JobID:   job.ID,
 			JobType: job.Type,
 			Event:   EventDiscarded,
-			Attempt: job.Attempts + 1,
-			Worker:  fmt.Sprintf("worker-%d", workerID),
+			Attempt: attempt,
+			Worker:  workerName,
 			Reason:  "lost ownership handshake to sweeper",
 		})
 		return
 	}
 
-	if err := rdb.LRem(ctx, inflightKey, 1, jobJSON).Err(); err != nil {
-		log.Printf("\033[31m[Worker %d] Error clearing Job %s from in-flight list: %v\033[0m", workerID, job.ID, err)
-	}
-
 	jobDuration.Observe(workDuration.Seconds())
-
-	workerName := fmt.Sprintf("worker-%d", workerID)
 
 	if runErr == nil {
 		jobsProcessed.WithLabelValues("success").Inc()
@@ -378,7 +443,7 @@ func settle(workerID int, rdb *redis.Client, job Job, jobJSON string, runErr err
 			JobID:      job.ID,
 			JobType:    job.Type,
 			Event:      EventSucceeded,
-			Attempt:    job.Attempts + 1,
+			Attempt:    attempt,
 			DurationMS: workDuration.Milliseconds(),
 			Worker:     workerName,
 		})
@@ -386,10 +451,8 @@ func settle(workerID int, rdb *redis.Client, job Job, jobJSON string, runErr err
 	}
 
 	jobsProcessed.WithLabelValues("failure").Inc()
-	job.Attempts++
 	log.Printf("\033[31m[Worker %d] ❌ Job %s FAILED (Attempt %d/%d): %v\033[0m",
 		workerID, job.ID, job.Attempts, attemptsFor(job.Type), runErr)
-
 	events.publish(JobEvent{
 		JobID:      job.ID,
 		JobType:    job.Type,
@@ -400,7 +463,7 @@ func settle(workerID int, rdb *redis.Client, job Job, jobJSON string, runErr err
 		Worker:     workerName,
 	})
 
-	retryOrBury(ctx, rdb, actor{label: "worker", name: fmt.Sprintf("Worker %d", workerID)}, job, runErr)
+	recordFailure(actor{label: "worker", name: fmt.Sprintf("Worker %d", workerID)}, job, plan, runErr)
 }
 
 // actor identifies who is applying the retry policy: name is for humans
@@ -408,62 +471,6 @@ func settle(workerID int, rdb *redis.Client, job Job, jobJSON string, runErr err
 type actor struct {
 	label string
 	name  string
-}
-
-// retryOrBury applies the retry policy to a failed job. Shared by the worker
-// and the sweeper so both paths behave identically.
-//
-// runErr is the handler's error, or nil when the sweeper is recovering a job
-// whose worker died and therefore never produced one.
-func retryOrBury(ctx context.Context, rdb *redis.Client, who actor, job Job, runErr error) {
-	jobJSON, err := json.Marshal(job)
-	if err != nil {
-		log.Printf("\033[31m[%s] Error marshalling Job %s: %v\033[0m", who.name, job.ID, err)
-		return
-	}
-
-	// A permanent error will fail identically on every future attempt, so
-	// spending the remaining budget (and the backoff waits) on it is pure
-	// latency for a guaranteed outcome. Bury it immediately.
-	permanent := errors.Is(runErr, ErrPermanent)
-	budget := attemptsFor(job.Type)
-
-	if !permanent && job.Attempts < budget {
-		if err := scheduleRetry(ctx, rdb, who, job, string(jobJSON)); err != nil {
-			log.Printf("\033[31m[%s] Error scheduling retry for job %s: %v\033[0m", who.name, job.ID, err)
-		}
-		return
-	}
-
-	if permanent {
-		log.Printf("\033[1;31m[%s] 💀 Job %s failed permanently (not retryable). Sending to DLQ.\033[0m", who.name, job.ID)
-	} else {
-		log.Printf("\033[1;31m[%s] 💀 Job %s exhausted %d attempts. Sending to DLQ.\033[0m", who.name, job.ID, budget)
-	}
-
-	if err := rdb.LPush(ctx, dlqKey, jobJSON).Err(); err != nil {
-		log.Printf("\033[31m[%s] Error sending job %s to DLQ: %v\033[0m", who.name, job.ID, err)
-		return
-	}
-
-	reason := "exhausted"
-	if permanent {
-		reason = "permanent"
-	}
-	jobsBuried.WithLabelValues(who.label, reason).Inc()
-
-	buried := JobEvent{
-		JobID:   job.ID,
-		JobType: job.Type,
-		Event:   EventBuried,
-		Attempt: job.Attempts,
-		Worker:  who.name,
-		Reason:  reason,
-	}
-	if runErr != nil {
-		buried.Error = runErr.Error()
-	}
-	events.publish(buried)
 }
 
 // sweeper looks for jobs stranded in the in-flight list by a crashed worker.
@@ -517,16 +524,7 @@ func sweeper(ctx context.Context, rdb *redis.Client, wg *sync.WaitGroup) {
 				deadline, err := scores[i].Result()
 
 				if errors.Is(err, redis.Nil) {
-					// In-flight but with no deadline at all: its owner died in
-					// the narrow window between BLMOVE and the claiming ZADD.
-					// Give it a deadline rather than reclaiming immediately -
-					// NX so we never stomp a worker that is merely a
-					// millisecond slow to register its own claim. If nobody
-					// heartbeats it, a later sweep reclaims it normally.
-					rdb.ZAddNX(ctx, deadlinesKey, redis.Z{
-						Score:  deadlineFrom(time.Now()),
-						Member: jobJSON,
-					})
+					adopt(ctx, rdb, jobJSON)
 					continue
 				}
 				if err != nil {
@@ -541,6 +539,29 @@ func sweeper(ctx context.Context, rdb *redis.Client, wg *sync.WaitGroup) {
 			}
 		}
 	}
+}
+
+// adoptScript gives a deadline to a job only if it is STILL in the in-flight
+// list, checked and written as one step.
+var adoptScript = redis.NewScript(`
+if redis.call('LPOS', KEYS[1], ARGV[1]) then
+  return redis.call('ZADD', KEYS[2], 'NX', ARGV[2], ARGV[1])
+end
+return 0
+`)
+
+// adopt gives a deadline to a job the sweeper saw in flight without one: its
+// owner died in the narrow window between BLMOVE and the claiming ZADD. It
+// gets a deadline rather than being reclaimed immediately - NX so a worker
+// that is merely a millisecond slow to register its own claim is never
+// stomped. If nobody heartbeats it, a later sweep reclaims it normally.
+//
+// The sweeper decided to adopt from a snapshot, and the job may have finished
+// since. Adopting unconditionally re-created a deadline for a job that was
+// gone - one that nothing would ever reclaim. The in-flight check inside the
+// script rules that out.
+func adopt(ctx context.Context, rdb *redis.Client, jobJSON string) {
+	adoptScript.Run(ctx, rdb, []string{inflightKey, deadlinesKey}, jobJSON, deadlineFrom(time.Now()))
 }
 
 // reapScript removes a deadline only if it is still at or below the cutoff,
@@ -558,12 +579,11 @@ return 0
 // reapOrphanDeadlines removes deadline entries that no longer have a job in
 // the in-flight list.
 //
-// Orphans come from two places. The ordinary one is a race: settle and
-// reclaim release a job in two commands (ZREM the deadline, then LREM the
-// list entry), and a sweeper snapshot taken between them sees an in-flight
-// job with no deadline and "adopts" it - recreating a deadline for a job that
-// has already finished. The other is two byte-identical payloads in flight at
-// once sharing one ZSET member, which EnqueueID prevents.
+// Normal operation no longer creates orphans: releases are one atomic script,
+// and adoption checks the job is still in flight. Both used to leave them
+// behind. What remains is two byte-identical payloads in flight at once,
+// sharing one ZSET member - EnqueueID prevents that, so this is the defence
+// for producers that do not set it.
 //
 // The sweeper walks the in-flight list, so nothing else would ever find
 // these, and before this existed they sat in Redis permanently.
@@ -604,33 +624,50 @@ func reapOrphanDeadlines(ctx context.Context, rdb *redis.Client, inflight []stri
 
 	if reaped > 0 {
 		deadlinesReaped.Add(float64(reaped))
-		log.Printf("\033[1;33m[Sweeper] 🧹 Reaped %d deadline(s) with no in-flight job. An occasional one is a benign race; a steady stream means a producer is enqueueing identical payloads without an enqueue_id.\033[0m", reaped)
+		log.Printf("\033[1;33m[Sweeper] 🧹 Reaped %d deadline(s) with no in-flight job. This means a producer is enqueueing identical payloads without an enqueue_id.\033[0m", reaped)
 	}
 	return reaped
 }
 
 // reclaim takes ownership of an expired job and applies the retry policy.
+// The release uses the same atomic handshake as settle, so the sweeper wins
+// or loses cleanly against the job's original worker and any other
+// consumer's sweeper.
 func reclaim(ctx context.Context, rdb *redis.Client, jobJSON string) {
-	// Same ownership handshake as settle: ZREM returning 1 means we won the
-	// race against the job's original worker and any other consumer's sweeper.
-	removed, err := rdb.ZRem(ctx, deadlinesKey, jobJSON).Result()
-	if err != nil || removed == 0 {
+	// Parse before touching Redis. The old order removed the job first and
+	// parsed it second, so a payload that could not be parsed was dropped -
+	// never retried, never quarantined.
+	var job Job
+	if err := json.Unmarshal([]byte(jobJSON), &job); err != nil {
+		owned, err := release(ctx, rdb, jobJSON, next{mode: "lpush", key: poisonKey, payload: jobJSON})
+		if err == nil && owned {
+			jobsPoisoned.Inc()
+			log.Printf("\033[1;31m[Sweeper] ☠️ Reclaimed an unparseable payload; quarantined to %s\033[0m", poisonKey)
+			events.publish(JobEvent{
+				JobID:  "unknown",
+				Event:  EventPoisoned,
+				Worker: "sweeper",
+				Reason: "reclaimed payload could not be parsed as a job",
+			})
+		}
 		return
 	}
 
-	if err := rdb.LRem(ctx, inflightKey, 1, jobJSON).Err(); err != nil {
-		log.Printf("\033[31m[Sweeper] Error clearing reclaimed job from in-flight list: %v\033[0m", err)
+	job.Attempts++
+	// nil error: the worker died, so it never reported why. A crash is always
+	// treated as retryable.
+	plan, err := planFailure(job, nil)
+	if err != nil {
+		return // untouched; the next sweep tries again
 	}
 
-	var job Job
-	if err := json.Unmarshal([]byte(jobJSON), &job); err != nil {
+	owned, err := release(ctx, rdb, jobJSON, plan.to)
+	if err != nil || !owned {
 		return
 	}
 
 	jobsRecovered.Inc()
-	job.Attempts++
 	log.Printf("\033[1;33m[Sweeper] ⚠️ Detected orphaned Job %s (Worker crashed). Reclaiming...\033[0m", job.ID)
-
 	events.publish(JobEvent{
 		JobID:   job.ID,
 		JobType: job.Type,
@@ -640,9 +677,5 @@ func reclaim(ctx context.Context, rdb *redis.Client, jobJSON string) {
 		Reason:  "owner stopped heartbeating",
 	})
 
-	dbCtx, dbCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer dbCancel()
-	// nil error: the worker died, so it never reported why. A crash is always
-	// treated as retryable.
-	retryOrBury(dbCtx, rdb, actor{label: "sweeper", name: "Sweeper"}, job, nil)
+	recordFailure(actor{label: "sweeper", name: "Sweeper"}, job, plan, nil)
 }

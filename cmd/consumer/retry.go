@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
 	"math"
@@ -38,48 +39,115 @@ func backoffFor(attempt int) time.Duration {
 	return time.Duration(jittered)
 }
 
-// scheduleRetry puts a job into the delayed set, scored by the epoch-ms at
-// which it becomes eligible again.
-//
-// This is the same ZSET-as-timer pattern the deadline tracking already uses:
-// a sorted set scored by a timestamp is a priority queue ordered by time, so
-// "everything that is due" is one range query.
-func scheduleRetry(ctx context.Context, rdb *redis.Client, who actor, job Job, jobJSON string) error {
-	delay := backoffFor(job.Attempts)
-	readyAt := time.Now().Add(delay)
+// failurePlan is where a failed job goes next. It is decided before Redis is
+// touched, so that releasing the job and writing its next state can be one
+// atomic transition (see releaseScript).
+type failurePlan struct {
+	to     next
+	retry  bool
+	delay  time.Duration // when retried
+	reason string        // "exhausted" or "permanent", when buried
+}
 
-	if err := rdb.ZAdd(ctx, delayedKey, redis.Z{
-		Score:  float64(readyAt.UnixMilli()),
-		Member: jobJSON,
-	}).Err(); err != nil {
-		return err
+// planFailure applies the retry policy to a job whose Attempts already counts
+// the attempt that just failed.
+//
+// Retries go into the delayed set, scored by the epoch-ms at which they
+// become eligible again: a sorted set scored by a timestamp is a priority
+// queue ordered by time, so "everything that is due" is one range query.
+func planFailure(job Job, runErr error) (failurePlan, error) {
+	payload, err := json.Marshal(job)
+	if err != nil {
+		return failurePlan{}, err
 	}
 
-	log.Printf("\033[35m[%s] 🔁 Job %s failed, retrying in %v (attempt %d/%d)\033[0m",
-		who.name, job.ID, delay.Round(time.Millisecond), job.Attempts, attemptsFor(job.Type))
+	// A permanent error will fail identically on every future attempt, so
+	// spending the remaining budget (and the backoff waits) on it is pure
+	// latency for a guaranteed outcome. Bury it immediately.
+	permanent := errors.Is(runErr, ErrPermanent)
+	if !permanent && job.Attempts < attemptsFor(job.Type) {
+		delay := backoffFor(job.Attempts)
+		return failurePlan{
+			retry: true,
+			delay: delay,
+			to: next{
+				mode:    "zadd",
+				key:     delayedKey,
+				payload: string(payload),
+				score:   float64(time.Now().Add(delay).UnixMilli()),
+			},
+		}, nil
+	}
 
-	jobsRetried.WithLabelValues(who.label).Inc()
-	retryDelay.Observe(delay.Seconds())
-
-	events.publish(JobEvent{
-		JobID:      job.ID,
-		JobType:    job.Type,
-		Event:      EventRetried,
-		Attempt:    job.Attempts,
-		DurationMS: delay.Milliseconds(),
-		Worker:     who.name,
-		Reason:     "scheduled for retry after backoff",
-	})
-	return nil
+	reason := "exhausted"
+	if permanent {
+		reason = "permanent"
+	}
+	return failurePlan{
+		reason: reason,
+		to:     next{mode: "lpush", key: dlqKey, payload: string(payload)},
+	}, nil
 }
+
+// recordFailure reports a failed job's next step. It runs only after the
+// transition has actually happened, so the logs, metrics and events never
+// describe a move that did not take place.
+func recordFailure(who actor, job Job, plan failurePlan, runErr error) {
+	if plan.retry {
+		log.Printf("\033[35m[%s] 🔁 Job %s failed, retrying in %v (attempt %d/%d)\033[0m",
+			who.name, job.ID, plan.delay.Round(time.Millisecond), job.Attempts, attemptsFor(job.Type))
+		jobsRetried.WithLabelValues(who.label).Inc()
+		retryDelay.Observe(plan.delay.Seconds())
+		events.publish(JobEvent{
+			JobID:      job.ID,
+			JobType:    job.Type,
+			Event:      EventRetried,
+			Attempt:    job.Attempts,
+			DurationMS: plan.delay.Milliseconds(),
+			Worker:     who.name,
+			Reason:     "scheduled for retry after backoff",
+		})
+		return
+	}
+
+	if plan.reason == "permanent" {
+		log.Printf("\033[1;31m[%s] 💀 Job %s failed permanently (not retryable). Sending to DLQ.\033[0m", who.name, job.ID)
+	} else {
+		log.Printf("\033[1;31m[%s] 💀 Job %s exhausted %d attempts. Sending to DLQ.\033[0m", who.name, job.ID, attemptsFor(job.Type))
+	}
+	jobsBuried.WithLabelValues(who.label, plan.reason).Inc()
+
+	buried := JobEvent{
+		JobID:   job.ID,
+		JobType: job.Type,
+		Event:   EventBuried,
+		Attempt: job.Attempts,
+		Worker:  who.name,
+		Reason:  plan.reason,
+	}
+	if runErr != nil {
+		buried.Error = runErr.Error()
+	}
+	events.publish(buried)
+}
+
+// promoteScript moves one due job from the delayed set onto the queue as a
+// single atomic step. ZREM is the claim, exactly like the ownership handshake
+// elsewhere: with several consumers running promoters, only the one whose
+// ZREM returns 1 pushes, so a job cannot be promoted twice. Doing the push in
+// the same script means a job can never be removed from the delayed set
+// without arriving on the queue - the old two-command version needed a
+// "put it back" fallback for that, which could itself fail.
+var promoteScript = redis.NewScript(`
+if redis.call('ZREM', KEYS[1], ARGV[1]) == 1 then
+  redis.call('LPUSH', KEYS[2], ARGV[1])
+  return 1
+end
+return 0
+`)
 
 // promoter moves jobs whose backoff has elapsed from the delayed set back onto
 // the main queue.
-//
-// Each job is claimed with ZREM before being pushed, exactly like the
-// ownership handshake elsewhere: with several consumers all running promoters,
-// only the one whose ZREM returns 1 gets to push, so a job cannot be promoted
-// twice.
 func promoter(ctx context.Context, rdb *redis.Client, wg *sync.WaitGroup) {
 	defer wg.Done()
 	log.Printf("\033[1;30m[Promoter] Watching for jobs whose backoff has elapsed...\033[0m")
@@ -118,20 +186,16 @@ func promoteDue(ctx context.Context, rdb *redis.Client) int {
 
 	promoted := 0
 	for _, jobJSON := range due {
-		// Claim it. Only the winner pushes.
-		claimed, err := rdb.ZRem(ctx, delayedKey, jobJSON).Result()
-		if err != nil || claimed == 0 {
+		n, err := promoteScript.Run(ctx, rdb, []string{delayedKey, queueKey}, jobJSON).Int()
+		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				// Nothing moved: the job is still in the delayed set and the
+				// next pass will try again.
+				log.Printf("\033[31m[Promoter] Failed to promote a job, will retry next pass: %v\033[0m", err)
+			}
 			continue
 		}
-
-		if err := rdb.LPush(ctx, queueKey, jobJSON).Err(); err != nil {
-			// Put it back so the job is not lost; it will be retried on the
-			// next pass.
-			log.Printf("\033[31m[Promoter] Failed to promote a job, returning it to the delayed set: %v\033[0m", err)
-			rdb.ZAdd(ctx, delayedKey, redis.Z{Score: float64(now), Member: jobJSON})
-			continue
-		}
-		promoted++
+		promoted += n
 	}
 
 	if promoted > 0 {

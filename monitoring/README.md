@@ -42,11 +42,18 @@ queries or the dashboard.
 |---|---|---|
 | `jobqueue_jobs_processed_total{result}` | counter | Throughput and failure ratio |
 | `jobqueue_jobs_retried_total{source}` | counter | Retries, split by worker vs sweeper |
-| `jobqueue_jobs_dlq_total{source}` | counter | Jobs that exhausted their attempts |
+| `jobqueue_jobs_dlq_total{source,reason}` | counter | Jobs buried in the DLQ. `reason` is `exhausted` (ran out of attempts, suggests a flaky dependency) or `permanent` (the handler said retrying cannot help, suggests a bad payload or a bug) |
 | `jobqueue_jobs_recovered_total` | counter | Sweeper reclaims after an owner stopped heartbeating |
-| `jobqueue_stale_results_discarded_total` | counter | Workers that finished a job the sweeper had already taken |
+| `jobqueue_stale_results_discarded_total` | counter | Workers that finished a job the sweeper had already taken. **Should stay at zero** |
+| `jobqueue_deadlines_reaped_total` | counter | Deadline entries with no in-flight job, cleaned up by the sweeper. **Should stay at zero**; non-zero means a producer is not setting `enqueue_id` |
+| `jobqueue_jobs_poisoned_total` | counter | Payloads that could not be parsed, moved to `jobs:poison` |
+| `jobqueue_jobs_promoted_total` | counter | Retries moved back onto the queue once their backoff elapsed |
+| `jobqueue_forced_shutdowns_total` | counter | Shutdowns that hit the deadline with jobs still running; usually a handler ignoring its context |
 | `jobqueue_job_duration_seconds` | histogram | Execution time, for percentiles |
-| `jobqueue_depth{structure}` | gauge | Live size of the queue, in-flight list, DLQ and deadlines ZSET |
+| `jobqueue_retry_delay_seconds` | histogram | Backoff applied before each retry, to confirm it is actually backing off |
+| `jobqueue_depth{structure}` | gauge | Sampled size of `pending`, `inflight`, `delayed`, `dlq`, `poison` and `claimed` (the deadlines ZSET). A sample, not a live value: wait on the counters above when you need to know a job has finished |
+| `jobqueue_events_published_total{event}` | counter | Lifecycle events written to Kafka |
+| `jobqueue_events_publish_errors_total` | counter | Events that could not be published, including ones dropped because Kafka was unreachable. Jobs are unaffected; the audit trail has gaps |
 
 ### The two that are worth watching
 

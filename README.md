@@ -57,10 +57,11 @@ publishing disabled. For Kubernetes see [k8s/README.md](k8s/README.md); for
 the metrics see [monitoring/README.md](monitoring/README.md).
 
 ```bash
-go test ./...        # 27 tests, no external services needed (uses miniredis)
+go test ./...                                         # 31 tests, no services needed (uses miniredis)
+REDIS_URL=redis://localhost:6379/0 bash scripts/smoke-test.sh   # the real binaries against a real, empty Redis
 ```
 
-CI additionally runs the suite under the race detector and an integration test
+CI runs the unit tests under the race detector, then runs the same smoke test
 against a real Redis.
 
 ---
@@ -204,7 +205,7 @@ on a Deployment or StatefulSet cannot change after it is created. Switching to
 
 ### 7. Identical payloads shared one identity, and jobs were lost
 
-*Fixed in the commit that adds this section.*
+*Fixed in `7f1779c`.*
 
 **What was happening.** After a crash-recovery test on Kubernetes,
 `jobs:inflight` was empty but `jobs:deadlines` still held an entry for
@@ -262,19 +263,13 @@ job ID were in flight together.
 | Valid results discarded as stale | 15 | **0** |
 
 **A third cause turned up during that run.** Even with unique IDs, one orphaned
-deadline was cleaned up. Tracing it led to a race in ordinary operation: a
-worker releases a job in two commands, `ZREM` the deadline and then `LREM` the
-list entry. A sweeper that looks in the ~1 ms between them sees a job still in
-flight with no deadline. It then "adopts" the job and creates a deadline for a
-job that has already finished. This is harmless (the new cleanup removes it
-within about 30 seconds), but before this fix those entries piled up forever.
-It is also why `jobqueue_deadlines_reaped_total` can show an occasional single
-increment on a healthy system. A steady climb is different: it means a
-producer is enqueueing identical payloads.
+deadline was cleaned up. It came from a race in ordinary operation, not from
+duplicate payloads, and it is the subject of [bug 10](#10-releasing-a-job-was-several-commands-and-a-failure-in-between-could-lose-it),
+where it was fixed at the source.
 
 ### 8. A Kafka outage would have stalled the entire queue
 
-*Fixed in the commit that adds this section.*
+*Fixed in `7f1779c`.*
 
 **What was happening.** The design goal was that Kafka is observability, not
 the critical path: if the broker is down, jobs keep running and only the audit
@@ -312,14 +307,119 @@ old code would have stalled after about 6 jobs), 100 of 100 jobs completed in
 14 seconds, and 300 events were dropped and counted. With Kafka back, all 100
 jobs reached Postgres again.
 
+### 9. CI had been failing since the day it was added, and nobody noticed
+
+*Fixed in the commit that adds this section.*
+
+**What was happening.** CI had run exactly once, and it failed. It was only
+found by going to check. The race-detector job had passed (the first time the
+worker pool, heartbeats, sweeper and promoter were ever checked for data
+races, since the race detector cannot run on the Windows machine this is
+developed on), but the integration job had not.
+
+**Why.** The integration test decided the queue had drained by reading the
+`jobqueue_depth` gauges from `/metrics`. Those gauges are *samples*, refreshed
+every 5 seconds, and the consumer takes its first one at startup, before any
+job exists. So on its first check after the producer ran, the test saw
+`pending=0 inflight=0 delayed=0`, concluded the queue was empty, and counted
+the finished jobs while almost all of them were still waiting. Reproduced
+locally: the loop exited on its first iteration and counted 1 finished job,
+while Redis held 93 queued and 4 in flight.
+
+This was a bug in the test, not the queue. It had still left a broken status
+on the repository for anyone who looked.
+
+**The fix.** The logic moved into [`scripts/smoke-test.sh`](scripts/smoke-test.sh),
+which CI runs and which also runs locally against any empty Redis, so the two
+can never drift apart. It waits on **counters**, which are exact and update
+the moment a job finishes, rather than on sampled gauges. It then asserts that
+exactly 100 jobs finished (fewer means one was lost, more means one finished
+twice), that no result was discarded as stale, that nothing was quarantined,
+and that nothing is left queued, in flight, delayed or claimed. On any
+failure it prints the consumer's log, so a failure can be diagnosed from the
+CI output alone.
+
+That last check, nothing left claimed, was new, and on its first run it
+failed. That led straight to bug 10.
+
+### 10. Releasing a job was several commands, and a failure in between could lose it
+
+*Fixed in the commit that adds this section.*
+
+**What was happening.** The new smoke test left **2 deadline entries behind
+per 100 jobs**, and both belonged to jobs with unique `enqueue_id`s, so this
+was not bug 7. The test sweeps every 200 ms rather than the default 3 s, which
+made a race visible that had been there all along.
+
+Releasing a job took up to four separate Redis commands: `ZREM` the deadline
+(the ownership check), `LREM` the job from the in-flight list, then `ZADD` it
+to the retry set or `LPUSH` it to the DLQ. Anything that happened between
+those commands saw a half-finished state. That caused four separate problems:
+
+- **Orphaned deadlines.** A sweeper that looked between the `ZREM` and the
+  `LREM` saw a job still in flight with no deadline. It "adopted" the job,
+  giving it a fresh deadline without checking whether the job was still there.
+  By then the worker had finished, so the new deadline belonged to a job that
+  no longer existed.
+- **Job loss on a Redis failure.** If Redis failed after the job had left the
+  in-flight list but before its retry or DLQ entry was written, the job
+  vanished. This was never observed, but it follows directly from the code.
+- **Crash recovery dropped unparseable payloads.** `reclaim` removed a job from
+  Redis first and parsed it second. A payload that could not be parsed was
+  already gone by the time that was discovered, so it was never retried and
+  never quarantined.
+- **Promotion could drop a retry.** The promoter removed a job from the retry
+  set, then pushed it onto the queue. If the push failed it tried to put the
+  job back, and that could fail too.
+
+**The fix.** Every change of state is now a single Lua script, which Redis
+runs to completion with nothing interleaved.
+
+- `releaseScript` does the ownership check, the removal from the in-flight
+  list and the write of the job's next state (retry set, DLQ or poison list)
+  as one step. The worker (`settle`) and the sweeper (`reclaim`) both release
+  jobs through it. Where the job goes next is decided in Go first, without
+  touching Redis, and the logs, metrics and events are only recorded once the
+  script confirms the move happened.
+- `adoptScript` gives a job a deadline only if it is still in the in-flight
+  list (`LPOS`), checked and written together.
+- `promoteScript` removes a job from the retry set and pushes it onto the
+  queue together, so the fallback is gone.
+- `reclaim` parses the payload before touching Redis, and sends an
+  unparseable one to the poison list as part of the same atomic release.
+
+**Proof.** Failing tests were written first: adoption re-created a deadline
+for a finished job, and crash recovery dropped an unparseable payload. On the
+live scenario that had left 2 orphaned deadlines per 100 jobs, **six runs in
+a row left none**. `jobqueue_deadlines_reaped_total` now really should stay at
+zero; the only thing left that can move it is a producer that does not set
+`enqueue_id`.
+
+**Re-checking the tests found one that had been blind.** After this change,
+every entry in the mutation table below was run again against the current
+code. One test turned out to have been passing no matter what:
+`TestSettleDiscardsResultAfterSweeperReclaim` still passed with the ownership
+check removed. The cause is the same ZSET behaviour as in bug 7. When the
+sweeper takes a job and a late worker then fails the same attempt, both
+produce an identical retry payload, and the retry set merges them into one
+entry. So counting the retry set cannot show a job being requeued twice.
+This had been true since retries moved into a ZSET in `89ea16f`, and the table
+below had listed the test as catching that mutation without re-checking it.
+The test now checks the counters instead (the worker must count the job as
+stale and must not schedule a retry), and a new test,
+`TestLateSuccessAfterReclaimIsNotCounted`, covers a worker that *succeeds*
+after losing the job. Both now fail when the ownership check is removed.
+
 ### Every fix is mutation-tested
 
 A passing test proves nothing unless it would fail on broken code. So each fix
-was deliberately removed, one at a time, to confirm a test catches it:
+was deliberately removed, one at a time, to confirm a test catches it. Every
+row below was re-run against the current code, not just when it was first
+written (see the end of bug 10 for why that matters).
 
 | Fix removed | Caught by |
 |---|---|
-| Ownership check (`ZREM` result ignored) | `TestSettleDiscardsResultAfterSweeperReclaim` |
+| Ownership check inside the atomic release | `TestSettleDiscardsResultAfterSweeperReclaim`, `TestLateSuccessAfterReclaimIsNotCounted` |
 | Heartbeat | `TestHeartbeatKeepsSlowWorkerFromBeingReclaimed` |
 | Orphan cleanup | `TestOrphanDeadlineIsReaped` |
 | Atomic check in the cleanup script | `TestReapIsAtomicAgainstReclaim` |
@@ -329,6 +429,9 @@ was deliberately removed, one at a time, to confirm a test catches it:
 | Unique enqueue IDs (producer side) | `TestEveryEnqueueIsUnique` |
 | Non-blocking publish | `TestPublishNeverBlocksWhenKafkaIsDown` |
 | Delivery timeout | `TestUndeliverableEventsAreDroppedNotHeldForever` |
+| Adoption's in-flight check | `TestAdoptionNeverResurrectsAFinishedJob` |
+| Crash recovery quarantining unparseable payloads | `TestReclaimOfUnparseablePayloadQuarantinesIt` |
+| Promotion claiming before it pushes | `TestPromoterReturnsJobsWhenDue` |
 
 ## Lessons from running it for real
 
@@ -359,9 +462,6 @@ cluster rather than from unit tests, which use an in-process Redis
   requeued twice. It does not prevent it running twice when a worker dies
   after finishing the work but before recording it. Handlers need to be
   idempotent, keyed on the job ID.
-- **Releasing a job takes two Redis commands.** This leaves the small race
-  described in bug 7. The cleanup handles it, but combining both steps into
-  one atomic script would remove it at the source.
 - **A pod that is shutting down can still pick up new jobs.** During a rollout,
   pods that were stopping took two jobs off the queue seconds after the new
   pods came up. Both completed, but ideally a stopping pod takes nothing new.

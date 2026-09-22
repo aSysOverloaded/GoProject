@@ -258,10 +258,24 @@ func TestSettleDiscardsResultAfterSweeperReclaim(t *testing.T) {
 		t.Fatalf("expected sweeper to schedule exactly 1 retry, got %d", len(got))
 	}
 
+	staleBefore := testutil.ToFloat64(staleResults)
+	workerRetriesBefore := testutil.ToFloat64(jobsRetried.WithLabelValues("worker"))
+
 	// The original worker now finishes and reports a failure. It lost the
 	// ownership handshake, so it must not requeue anything.
 	settle(1, rdb, job, jobJSON, errFail, 10*time.Millisecond)
 
+	// The counters are the reliable check here. A second requeue of this job
+	// produces a byte-identical retry payload, and jobs:delayed is a ZSET,
+	// which silently merges identical members - so counting the delayed set
+	// alone cannot see a double requeue. This test used to rely on that
+	// count, and removing the ownership check did not make it fail.
+	if got := testutil.ToFloat64(staleResults) - staleBefore; got != 1 {
+		t.Errorf("stale_results moved by %v, want 1: the worker did not recognise it had lost the job", got)
+	}
+	if got := testutil.ToFloat64(jobsRetried.WithLabelValues("worker")) - workerRetriesBefore; got != 0 {
+		t.Errorf("worker scheduled %v retry/retries for a job the sweeper already took; want 0", got)
+	}
 	if got := delayedContents(t, rdb); len(got) != 1 {
 		t.Errorf("job was requeued twice: delayed set holds %d entries, want 1 (%v)", len(got), got)
 	}
@@ -277,6 +291,38 @@ func TestSettleDiscardsResultAfterSweeperReclaim(t *testing.T) {
 	}
 	if requeued.Attempts != 1 {
 		t.Errorf("attempt counter = %d, want 1 (double-counting inflates this)", requeued.Attempts)
+	}
+}
+
+// TestLateSuccessAfterReclaimIsNotCounted covers the other half of the
+// handshake: the worker SUCCEEDS after the sweeper has already rescheduled
+// the job. The job will run again - that is the at-least-once guarantee, and
+// the worker cannot take the retry back - but the worker must not also
+// record a success for a job it no longer owns.
+func TestLateSuccessAfterReclaimIsNotCounted(t *testing.T) {
+	useFastTimings(t)
+	rdb := newTestRedis(t)
+	ctx := context.Background()
+
+	job := Job{ID: "job-late", Payload: "work", EnqueueID: "late"}
+	jobJSON := mustMarshal(t, job)
+	rdb.RPush(ctx, inflightKey, jobJSON)
+	rdb.ZAdd(ctx, deadlinesKey, redis.Z{
+		Score:  float64(time.Now().Add(-time.Minute).UnixMilli()),
+		Member: jobJSON,
+	})
+	reclaim(ctx, rdb, jobJSON)
+
+	staleBefore := testutil.ToFloat64(staleResults)
+	successBefore := testutil.ToFloat64(jobsProcessed.WithLabelValues("success"))
+
+	settle(1, rdb, job, jobJSON, nil, 10*time.Millisecond)
+
+	if got := testutil.ToFloat64(jobsProcessed.WithLabelValues("success")) - successBefore; got != 0 {
+		t.Errorf("worker recorded %v success(es) for a job the sweeper had already taken", got)
+	}
+	if got := testutil.ToFloat64(staleResults) - staleBefore; got != 1 {
+		t.Errorf("stale_results moved by %v, want 1", got)
 	}
 }
 
@@ -312,15 +358,27 @@ func TestSettleSuccessLeavesNoResidue(t *testing.T) {
 	}
 }
 
-// TestRetryOrBuryRoutesToDLQAtMaxAttempts pins the retry policy that both the
-// worker and the sweeper now share.
-func TestRetryOrBuryRoutesToDLQAtMaxAttempts(t *testing.T) {
+// failInFlight puts a job in flight with a live claim, exactly as a worker
+// holds it, then settles it as failed with runErr - the real release path.
+// settle counts the attempt that just ran, so a job seeded with Attempts n
+// comes out with n+1.
+func failInFlight(t *testing.T, rdb *redis.Client, job Job, runErr error) {
+	t.Helper()
+	ctx := context.Background()
+	jobJSON := mustMarshal(t, job)
+	rdb.RPush(ctx, inflightKey, jobJSON)
+	rdb.ZAdd(ctx, deadlinesKey, redis.Z{Score: deadlineFrom(time.Now()), Member: jobJSON})
+	settle(1, rdb, job, jobJSON, runErr, time.Millisecond)
+}
+
+// TestFailedJobRoutesToDLQAtMaxAttempts pins the retry policy that both the
+// worker and the sweeper share.
+func TestFailedJobRoutesToDLQAtMaxAttempts(t *testing.T) {
 	useFastTimings(t)
 	rdb := newTestRedis(t)
-	ctx := context.Background()
-	worker1 := actor{label: "worker", name: "Worker 1"}
 
-	retryOrBury(ctx, rdb, worker1, Job{ID: "job-retry", Attempts: maxAttempts - 1}, errFail)
+	// Fails on its second-to-last allowed attempt: must be retried.
+	failInFlight(t, rdb, Job{ID: "job-retry", Attempts: maxAttempts - 2}, errFail)
 	if got := delayedContents(t, rdb); len(got) != 1 {
 		t.Errorf("job below the attempt limit should be scheduled for retry, delayed set has %d entries", len(got))
 	}
@@ -328,7 +386,8 @@ func TestRetryOrBuryRoutesToDLQAtMaxAttempts(t *testing.T) {
 		t.Errorf("job below the attempt limit should not be buried, DLQ has %d entries", len(got))
 	}
 
-	retryOrBury(ctx, rdb, worker1, Job{ID: "job-dead", Attempts: maxAttempts}, errFail)
+	// Fails on its last allowed attempt: must be buried.
+	failInFlight(t, rdb, Job{ID: "job-dead", Attempts: maxAttempts - 1}, errFail)
 	if got := queueContents(t, rdb, dlqKey); len(got) != 1 {
 		t.Errorf("job at the attempt limit should go to the DLQ, DLQ has %d entries", len(got))
 	}
@@ -343,12 +402,10 @@ func TestRetryOrBuryRoutesToDLQAtMaxAttempts(t *testing.T) {
 func TestPermanentErrorSkipsRetries(t *testing.T) {
 	useFastTimings(t)
 	rdb := newTestRedis(t)
-	ctx := context.Background()
 
 	// Attempt 1 of 3: normally this would be retried.
 	permanent := fmt.Errorf("bad payload: %w", ErrPermanent)
-	retryOrBury(ctx, rdb, actor{label: "worker", name: "Worker 1"},
-		Job{ID: "job-poisonous", Attempts: 1}, permanent)
+	failInFlight(t, rdb, Job{ID: "job-poisonous", Attempts: 0}, permanent)
 
 	if got := delayedContents(t, rdb); len(got) != 0 {
 		t.Errorf("permanent failure should not be retried, delayed set has %d entries: %v", len(got), got)

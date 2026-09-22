@@ -172,11 +172,10 @@ func TestDuplicateEnqueuesAreTrackedIndependently(t *testing.T) {
 func TestDuplicateRetriesAreNotCollapsed(t *testing.T) {
 	useFastTimings(t)
 	rdb := newTestRedis(t)
-	ctx := context.Background()
-	w := actor{label: "worker", name: "Worker 1"}
 
-	retryOrBury(ctx, rdb, w, Job{ID: "job-48", Payload: "p", Attempts: 1, EnqueueID: "first"}, errFail)
-	retryOrBury(ctx, rdb, w, Job{ID: "job-48", Payload: "p", Attempts: 1, EnqueueID: "second"}, errFail)
+	// Two enqueues of job-48, each failing its first attempt.
+	failInFlight(t, rdb, Job{ID: "job-48", Payload: "p", Attempts: 0, EnqueueID: "first"}, errFail)
+	failInFlight(t, rdb, Job{ID: "job-48", Payload: "p", Attempts: 0, EnqueueID: "second"}, errFail)
 
 	if got := delayedContents(t, rdb); len(got) != 2 {
 		t.Fatalf("delayed set holds %d retries, want 2 - one job was lost by ZSET de-duplication: %v", len(got), got)
@@ -209,10 +208,8 @@ func TestPayloadWithoutEnqueueIDIsUnchanged(t *testing.T) {
 func TestEnqueueIDSurvivesRetry(t *testing.T) {
 	useFastTimings(t)
 	rdb := newTestRedis(t)
-	ctx := context.Background()
 
-	retryOrBury(ctx, rdb, actor{label: "worker", name: "Worker 1"},
-		Job{ID: "job-7", Payload: "p", Attempts: 1, EnqueueID: "keep-me"}, errFail)
+	failInFlight(t, rdb, Job{ID: "job-7", Payload: "p", Attempts: 0, EnqueueID: "keep-me"}, errFail)
 
 	delayed := delayedContents(t, rdb)
 	if len(delayed) != 1 {
@@ -224,6 +221,74 @@ func TestEnqueueIDSurvivesRetry(t *testing.T) {
 	}
 	if got.EnqueueID != "keep-me" {
 		t.Errorf("enqueue_id after retry = %q, want it preserved", got.EnqueueID)
+	}
+}
+
+// --- Atomic state transitions ---
+
+// TestAdoptionNeverResurrectsAFinishedJob covers how orphaned deadlines were
+// being created in normal operation. The sweeper reads the in-flight list,
+// sees a job with no deadline, and adopts it - but by the time it acts, the
+// worker may have finished and released that job. Adopting it then creates a
+// deadline for a job that is gone, which nothing would ever reclaim.
+func TestAdoptionNeverResurrectsAFinishedJob(t *testing.T) {
+	useFastTimings(t)
+	rdb := newTestRedis(t)
+	ctx := context.Background()
+
+	finished := mustMarshal(t, Job{ID: "finished", EnqueueID: "x"})
+	// Not in jobs:inflight any more: its worker already released it.
+	adopt(ctx, rdb, finished)
+
+	if n, _ := rdb.ZCard(ctx, deadlinesKey).Result(); n != 0 {
+		t.Fatalf("adoption created a deadline for a job that is no longer in flight; it can never be reclaimed and sits in Redis until reaped")
+	}
+}
+
+// TestAdoptionStillCoversACrashedWorker guards the reason adoption exists: a
+// worker that died between BLMOVE and its claiming ZADD leaves a job in
+// flight with no deadline, and that job must still get one.
+func TestAdoptionStillCoversACrashedWorker(t *testing.T) {
+	useFastTimings(t)
+	rdb := newTestRedis(t)
+	ctx := context.Background()
+
+	orphan := mustMarshal(t, Job{ID: "orphan", EnqueueID: "y"})
+	rdb.RPush(ctx, inflightKey, orphan)
+
+	adopt(ctx, rdb, orphan)
+
+	if _, err := rdb.ZScore(ctx, deadlinesKey, orphan).Result(); err != nil {
+		t.Fatalf("in-flight job with no deadline was not adopted: %v", err)
+	}
+}
+
+// TestReclaimOfUnparseablePayloadQuarantinesIt covers silent data loss in
+// crash recovery. reclaim removed the job from Redis first and parsed it
+// second, so a payload that could not be parsed was simply dropped - never
+// retried, never quarantined.
+func TestReclaimOfUnparseablePayloadQuarantinesIt(t *testing.T) {
+	useFastTimings(t)
+	rdb := newTestRedis(t)
+	ctx := context.Background()
+
+	garbage := "{not valid json"
+	rdb.RPush(ctx, inflightKey, garbage)
+	rdb.ZAdd(ctx, deadlinesKey, redis.Z{
+		Score:  float64(time.Now().Add(-time.Minute).UnixMilli()),
+		Member: garbage,
+	})
+
+	reclaim(ctx, rdb, garbage)
+
+	if got := queueContents(t, rdb, poisonKey); len(got) != 1 || got[0] != garbage {
+		t.Fatalf("poison list = %v, want the unparseable payload preserved there", got)
+	}
+	if got := queueContents(t, rdb, inflightKey); len(got) != 0 {
+		t.Errorf("payload left in flight: %v", got)
+	}
+	if n, _ := rdb.ZCard(ctx, deadlinesKey).Result(); n != 0 {
+		t.Errorf("%d deadline(s) left behind", n)
 	}
 }
 
