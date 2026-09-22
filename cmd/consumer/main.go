@@ -15,6 +15,8 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
+
+	"jobqueue/internal/startup"
 )
 
 type Job struct {
@@ -65,10 +67,7 @@ func main() {
 	rdb := redis.NewClient(opt)
 	defer rdb.Close()
 
-	ctx, cancelConn := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancelConn()
-
-	if err := rdb.Ping(ctx).Err(); err != nil {
+	if err := connectRedis(rdb, cfg.StartupTimeout); err != nil {
 		log.Printf("\033[1;31m[System] Error connecting to Redis: %v\033[0m", err)
 		log.Println("\033[1;33m[System] Please make sure Redis is running locally or check your REDIS_URL.\033[0m")
 		os.Exit(1)
@@ -139,6 +138,15 @@ func main() {
 	}
 
 	log.Printf("\033[1;32m[System] Shutdown complete.\033[0m")
+}
+
+// connectRedis waits, for up to within, for Redis to answer before any worker
+// starts. It used to make a single attempt and exit on failure, so a Redis
+// that was merely slow to start crash-looped the consumer.
+func connectRedis(rdb *redis.Client, within time.Duration) error {
+	return startup.Retry("Redis", within, func(ctx context.Context) error {
+		return rdb.Ping(ctx).Err()
+	})
 }
 
 // waitTimeout waits for wg, returning false if the deadline passes first.

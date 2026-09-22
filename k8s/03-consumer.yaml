@@ -110,13 +110,15 @@ spec:
             failureThreshold: 2
 
           # Startup probe keeps the liveness probe from firing during a slow
-          # first Redis connection.
+          # first Redis connection. Its budget (2s x 30 = 60s) must exceed
+          # STARTUP_TIMEOUT (30s), because /healthz only answers once Redis
+          # has connected.
           startupProbe:
             httpGet:
               path: /healthz
               port: metrics
             periodSeconds: 2
-            failureThreshold: 15
+            failureThreshold: 30
 
           resources:
             requests:

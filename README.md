@@ -57,7 +57,7 @@ publishing disabled. For Kubernetes see [k8s/README.md](k8s/README.md); for
 the metrics see [monitoring/README.md](monitoring/README.md).
 
 ```bash
-go test ./...                                         # 31 tests, no services needed (uses miniredis)
+go test ./...                                         # 37 tests, no services needed (uses miniredis)
 REDIS_URL=redis://localhost:6379/0 bash scripts/smoke-test.sh   # the real binaries against a real, empty Redis
 ```
 
@@ -309,7 +309,7 @@ jobs reached Postgres again.
 
 ### 9. CI had been failing since the day it was added, and nobody noticed
 
-*Fixed in the commit that adds this section.*
+*Fixed in `7ab5139`.*
 
 **What was happening.** CI had run exactly once, and it failed. It was only
 found by going to check. The race-detector job had passed (the first time the
@@ -344,7 +344,7 @@ failed. That led straight to bug 10.
 
 ### 10. Releasing a job was several commands, and a failure in between could lose it
 
-*Fixed in the commit that adds this section.*
+*Fixed in `7ab5139`.*
 
 **What was happening.** The new smoke test left **2 deadline entries behind
 per 100 jobs**, and both belonged to jobs with unique `enqueue_id`s, so this
@@ -410,6 +410,56 @@ stale and must not schedule a retry), and a new test,
 `TestLateSuccessAfterReclaimIsNotCounted`, covers a worker that *succeeds*
 after losing the job. Both now fail when the ownership check is removed.
 
+### 11. A slow dependency at startup killed the process
+
+*Fixed in the commit that adds this section.*
+
+**What was happening.** The consumer checked Redis with a single `PING` and a
+3-second timeout, and exited if it failed. The auditor did the same with
+Postgres. So a dependency that was merely slow to come up took the process
+down with it.
+
+This had been visible for a while without being recognized. On Kubernetes,
+every consumer and auditor pod showed two restarts: each started before Redis
+or Postgres was ready, exited, and was restarted until it was. Kubernetes hid
+the problem by restarting them, but its restart delay grows each time and the
+pods go into `CrashLoopBackOff`. Anywhere without an orchestrator, such as a
+laptop or a CI job, the process just dies.
+
+**How it was found.** The smoke test from bug 9 failed intermittently with
+"consumer never became healthy". The first time, nothing explained why. That
+is why the script now prints the consumer's log on failure, and the next
+failure showed the cause at once:
+
+```
+[System] Connecting to Redis...
+[System] Error connecting to Redis: context deadline exceeded     (3 seconds later)
+(consumer process has exited)
+```
+
+**The fix.** [`internal/startup`](internal/startup/startup.go) waits for a
+dependency for a bounded time, controlled by `STARTUP_TIMEOUT` (30 seconds by
+default). It retries with exponential backoff from 250 ms up to 5 s, and gives
+each attempt its own timeout so that one hung connection cannot use up the
+whole budget. The consumer uses it for Redis and the auditor for Postgres. A
+dependency that is genuinely down still fails startup once the budget runs
+out, and then the orchestrator takes over.
+
+On Kubernetes this adds a rule that mirrors the shutdown one. The consumer only
+starts answering `/healthz` after it connects, so `STARTUP_TIMEOUT` (30s) must
+be shorter than the startup probe's budget (2s × 30 = 60s). Otherwise Kubernetes
+would kill the pod just as Redis arrived. In both cases, the app's own
+deadline has to fire before the orchestrator's.
+
+**Proof.** A failing test was written first: it starts Redis 4 seconds late.
+The old code gave up after 1.7 seconds; the new code connects at about 4.1
+seconds. Getting that test right took two attempts. With a 2-second delay, the
+old code sometimes connected anyway: on Windows a refused connection takes a
+while to be reported, and together with go-redis's own internal retries, a
+single `PING` could stretch past 2 seconds. A test that sometimes passes on
+broken code proves nothing, so the delay is now longer than one attempt can
+cover.
+
 ### Every fix is mutation-tested
 
 A passing test proves nothing unless it would fail on broken code. So each fix
@@ -432,6 +482,9 @@ written (see the end of bug 10 for why that matters).
 | Adoption's in-flight check | `TestAdoptionNeverResurrectsAFinishedJob` |
 | Crash recovery quarantining unparseable payloads | `TestReclaimOfUnparseablePayloadQuarantinesIt` |
 | Promotion claiming before it pushes | `TestPromoterReturnsJobsWhenDue` |
+| Startup retrying instead of giving up on the first attempt | `TestConnectRedisWaitsForRedisThatStartsLate`, `TestRetrySucceedsAfterTransientFailures` |
+| Startup giving up once its budget runs out | `TestRetryGivesUpAtItsDeadline` |
+| Each startup attempt having its own timeout | `TestRetryBoundsEachAttempt` |
 
 ## Lessons from running it for real
 

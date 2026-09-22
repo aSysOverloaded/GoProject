@@ -30,6 +30,8 @@ import (
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/twmb/franz-go/pkg/kgo"
+
+	"jobqueue/internal/startup"
 )
 
 // JobEvent mirrors the producer's schema. In a larger system this would be a
@@ -77,9 +79,16 @@ func main() {
 	db.SetMaxIdleConns(2)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
-	pingCtx, cancelPing := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelPing()
-	if err := db.PingContext(pingCtx); err != nil {
+	// Wait for Postgres rather than exiting on the first failed attempt. On
+	// Kubernetes the auditor used to start before Postgres was ready and
+	// crash-loop until it was.
+	startupTimeout := 30 * time.Second
+	if v := os.Getenv("STARTUP_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			startupTimeout = d
+		}
+	}
+	if err := startup.Retry("Postgres", startupTimeout, db.PingContext); err != nil {
 		log.Fatalf("[DB] Cannot reach Postgres: %v", err)
 	}
 	log.Println("[DB] Connected to Postgres.")

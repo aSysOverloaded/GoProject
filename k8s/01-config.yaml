@@ -17,6 +17,14 @@ data:
 
   WORKER_COUNT: "3"
 
+  # How long to wait for Redis (consumer) or Postgres (auditor) at startup
+  # before giving up. Must stay BELOW the consumer's startupProbe budget
+  # (60s, in 03-consumer.yaml): the consumer only starts answering /healthz
+  # once it has connected, so if the probe gave up first, Kubernetes would
+  # kill the pod right as Redis arrived. Same rule as SHUTDOWN_TIMEOUT below -
+  # the app's own deadline has to fire before the orchestrator's.
+  STARTUP_TIMEOUT: "30s"
+
   # SHUTDOWN_TIMEOUT must stay BELOW the Pod's terminationGracePeriodSeconds.
   # Kubernetes sends SIGTERM, waits the grace period, then SIGKILLs. If the
   # app's own deadline were the longer of the two it would never get to run:

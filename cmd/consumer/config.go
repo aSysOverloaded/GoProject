@@ -16,6 +16,7 @@ type Config struct {
 	RedisURL        string
 	MetricsAddr     string
 	NumWorkers      int
+	StartupTimeout  time.Duration
 	ShutdownTimeout time.Duration
 
 	VisTimeout     time.Duration
@@ -34,6 +35,7 @@ func loadConfig() Config {
 		RedisURL:        envString("REDIS_URL", "redis://localhost:6379/0"),
 		MetricsAddr:     envString("METRICS_ADDR", ":2112"),
 		NumWorkers:      envInt("WORKER_COUNT", 3),
+		StartupTimeout:  envDuration("STARTUP_TIMEOUT", 30*time.Second),
 		ShutdownTimeout: envDuration("SHUTDOWN_TIMEOUT", 30*time.Second),
 
 		VisTimeout:     envDuration("VISIBILITY_TIMEOUT", 15*time.Second),

@@ -13,8 +13,14 @@
 
 ```
 SHUTDOWN_TIMEOUT (25s)  <  terminationGracePeriodSeconds (30s)
+STARTUP_TIMEOUT (30s)   <  startupProbe budget (2s x 30 = 60s)
 HEARTBEAT_INTERVAL (5s) <  VISIBILITY_TIMEOUT (15s), by at least 3x
 ```
+
+The first two are the same rule: **the app's own deadline has to fire before
+the orchestrator's.** The consumer waits up to `STARTUP_TIMEOUT` for Redis and
+only answers `/healthz` once connected; if the startup probe gave up sooner,
+Kubernetes would restart the pod just as Redis arrived.
 
 **The first one is the one people get wrong.** Kubernetes sends SIGTERM,
 waits `terminationGracePeriodSeconds`, then SIGKILLs. If the app's own
