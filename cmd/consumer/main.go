@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -24,6 +25,20 @@ type Job struct {
 	Type     string `json:"type,omitempty"`
 	Payload  string `json:"payload"`
 	Attempts int    `json:"attempts"`
+
+	// EnqueueID is unique per enqueue, set by the producer. It exists because
+	// the serialised job is its own identity in Redis: the in-flight list
+	// element and the deadlines ZSET member are the raw JSON. Two enqueues of
+	// the same logical job ("job-48" twice) used to serialise identically, so
+	// while both were in flight they shared ONE deadline member - one
+	// worker's ZREM then released the other's claim, a valid result was
+	// discarded as stale, and a deadline could be left behind with no job.
+	// A unique field per enqueue makes every in-flight copy distinct.
+	//
+	// omitempty keeps payloads from producers that do not set it
+	// byte-identical to before, so they still parse and still work - they
+	// just do not get the protection.
+	EnqueueID string `json:"enqueue_id,omitempty"`
 }
 
 func main() {
@@ -474,6 +489,12 @@ func sweeper(ctx context.Context, rdb *redis.Client, wg *sync.WaitGroup) {
 				}
 				continue
 			}
+
+			// Runs before the empty-list early exit on purpose: the leak it
+			// cleans up is precisely a deadline with no in-flight job, which
+			// is most likely to be sitting there when the list is empty.
+			reapOrphanDeadlines(ctx, rdb, inflight)
+
 			if len(inflight) == 0 {
 				continue
 			}
@@ -520,6 +541,72 @@ func sweeper(ctx context.Context, rdb *redis.Client, wg *sync.WaitGroup) {
 			}
 		}
 	}
+}
+
+// reapScript removes a deadline only if it is still at or below the cutoff,
+// as one atomic step. Checking and removing in two separate commands would
+// race with a worker re-claiming the same member in between: a fresh claim
+// could be deleted out from under it.
+var reapScript = redis.NewScript(`
+local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
+if score and tonumber(score) <= tonumber(ARGV[2]) then
+  return redis.call('ZREM', KEYS[1], ARGV[1])
+end
+return 0
+`)
+
+// reapOrphanDeadlines removes deadline entries that no longer have a job in
+// the in-flight list.
+//
+// Orphans come from two places. The ordinary one is a race: settle and
+// reclaim release a job in two commands (ZREM the deadline, then LREM the
+// list entry), and a sweeper snapshot taken between them sees an in-flight
+// job with no deadline and "adopts" it - recreating a deadline for a job that
+// has already finished. The other is two byte-identical payloads in flight at
+// once sharing one ZSET member, which EnqueueID prevents.
+//
+// The sweeper walks the in-flight list, so nothing else would ever find
+// these, and before this existed they sat in Redis permanently.
+//
+// Safety: only deadlines expired by a further full visibility timeout are
+// considered, and each is removed atomically only if still that old. A live
+// claim always scores in the future, so it can never qualify - even if its
+// job was picked up after the in-flight snapshot was taken.
+func reapOrphanDeadlines(ctx context.Context, rdb *redis.Client, inflight []string) int {
+	cutoff := time.Now().Add(-visTimeout).UnixMilli()
+
+	stale, err := rdb.ZRangeByScore(ctx, deadlinesKey, &redis.ZRangeBy{
+		Min:   "-inf",
+		Max:   strconv.FormatInt(cutoff, 10),
+		Count: 100,
+	}).Result()
+	if err != nil || len(stale) == 0 {
+		return 0
+	}
+
+	live := make(map[string]struct{}, len(inflight))
+	for _, member := range inflight {
+		live[member] = struct{}{}
+	}
+
+	reaped := 0
+	for _, member := range stale {
+		if _, ok := live[member]; ok {
+			// Its job is in flight, so its owner died: that is the reclaim
+			// path's job, and it must be requeued rather than just dropped.
+			continue
+		}
+		n, err := reapScript.Run(ctx, rdb, []string{deadlinesKey}, member, cutoff).Int()
+		if err == nil && n == 1 {
+			reaped++
+		}
+	}
+
+	if reaped > 0 {
+		deadlinesReaped.Add(float64(reaped))
+		log.Printf("\033[1;33m[Sweeper] 🧹 Reaped %d deadline(s) with no in-flight job. An occasional one is a benign race; a steady stream means a producer is enqueueing identical payloads without an enqueue_id.\033[0m", reaped)
+	}
+	return reaped
 }
 
 // reclaim takes ownership of an expired job and applies the retry policy.

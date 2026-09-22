@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"os"
 	"strconv"
@@ -76,14 +77,50 @@ func newPublisher() *publisher {
 		return nil
 	}
 
-	topic := os.Getenv("KAFKA_TOPIC")
-	if topic == "" {
-		topic = "job-events"
+	topic := envString("KAFKA_TOPIC", "job-events")
+	maxBuffered := envInt("KAFKA_MAX_BUFFERED_RECORDS", 10000)
+	deliveryTimeout := envDuration("KAFKA_DELIVERY_TIMEOUT", 30*time.Second)
+	if deliveryTimeout < time.Second {
+		// franz-go rejects a record timeout below one second, and a rejected
+		// client config would silently disable events altogether.
+		log.Printf("\033[1;33m[Events] KAFKA_DELIVERY_TIMEOUT %v is below the 1s minimum; using 1s\033[0m", deliveryTimeout)
+		deliveryTimeout = time.Second
 	}
 
+	p, err := buildPublisher(strings.Split(brokers, ","), topic, maxBuffered, deliveryTimeout)
+	if err != nil {
+		log.Printf("\033[31m[Events] Failed to create Kafka client, continuing without events: %v\033[0m", err)
+		return nil
+	}
+
+	// Create the topic explicitly rather than relying on the broker's
+	// auto-create. Auto-create is disabled on most real clusters, and even
+	// where it is on it silently gives you the broker's default partition
+	// count and replication factor - which is how a topic ends up with one
+	// partition and no redundancy in production. Being explicit means the
+	// partition count is a decision, not an accident.
+	ensureTopic(p.client, topic)
+
+	log.Printf("\033[1;34m[Events] Publishing job events to Kafka topic %q via %s\033[0m", topic, brokers)
+	return p
+}
+
+// buildPublisher creates the Kafka client. It is separate from newPublisher
+// so tests can build one against an unreachable broker without environment
+// variables or the topic-creation round trip.
+func buildPublisher(brokers []string, topic string, maxBuffered int, deliveryTimeout time.Duration) (*publisher, error) {
 	client, err := kgo.NewClient(
-		kgo.SeedBrokers(strings.Split(brokers, ",")...),
+		kgo.SeedBrokers(brokers...),
 		kgo.DefaultProduceTopic(topic),
+
+		// Together these two make a Kafka outage cost bounded memory rather
+		// than unbounded memory. The cap limits how many events can wait at
+		// once; the delivery timeout releases an event that could not be
+		// delivered in time, instead of retrying it forever. Without the
+		// timeout an unreachable broker holds every event indefinitely, and
+		// the buffer never drains.
+		kgo.MaxBufferedRecords(maxBuffered),
+		kgo.RecordDeliveryTimeout(deliveryTimeout),
 
 		// Idempotent producer: the broker de-duplicates retries using a
 		// producer ID and sequence number, so a network retry cannot write
@@ -109,25 +146,15 @@ func newPublisher() *publisher {
 		})),
 	)
 	if err != nil {
-		log.Printf("\033[31m[Events] Failed to create Kafka client, continuing without events: %v\033[0m", err)
-		return nil
+		return nil, err
 	}
-
-	// Create the topic explicitly rather than relying on the broker's
-	// auto-create. Auto-create is disabled on most real clusters, and even
-	// where it is on it silently gives you the broker's default partition
-	// count and replication factor - which is how a topic ends up with one
-	// partition and no redundancy in production. Being explicit means the
-	// partition count is a decision, not an accident.
-	ensureTopic(client, topic)
 
 	host, _ := os.Hostname()
 	if podName := os.Getenv("POD_NAME"); podName != "" {
 		host = podName
 	}
 
-	log.Printf("\033[1;34m[Events] Publishing job events to Kafka topic %q via %s\033[0m", topic, brokers)
-	return &publisher{client: client, topic: topic, host: host}
+	return &publisher{client: client, topic: topic, host: host}, nil
 }
 
 // ensureTopic creates the events topic if it does not exist. Several
@@ -181,6 +208,13 @@ func ensureTopic(client *kgo.Client, topic string) {
 // unreachable the queue keeps draining and only the audit trail suffers.
 // Making this synchronous would add a network round trip to every job and
 // turn a Kafka outage into a job queue outage.
+//
+// "Asynchronous" was not enough on its own. The original code used Produce,
+// which is asynchronous right up until the client's record buffer is full -
+// and then it BLOCKS until space frees. With the broker unreachable, nothing
+// ever frees space, so after ~10,000 events every worker hung here and the
+// whole queue stalled. TryProduce fails immediately instead (ErrMaxBuffered),
+// so a full buffer costs an audit event, never a job.
 func (p *publisher) publish(ev JobEvent) {
 	if p == nil {
 		return
@@ -212,7 +246,7 @@ func (p *publisher) publish(ev JobEvent) {
 		},
 	}
 
-	p.client.Produce(context.Background(), record, func(_ *kgo.Record, err error) {
+	p.client.TryProduce(context.Background(), record, func(_ *kgo.Record, err error) {
 		if err != nil {
 			n := p.failed.Add(1)
 			kafkaPublishErrors.Inc()
@@ -220,7 +254,11 @@ func (p *publisher) publish(ev JobEvent) {
 			// errors makes a broken event stream impossible to diagnose,
 			// but logging every one would drown the job logs.
 			if n == 1 || n%100 == 0 {
-				log.Printf("\033[31m[Events] Publish failed (%d so far): %v\033[0m", n, err)
+				if errors.Is(err, kgo.ErrMaxBuffered) {
+					log.Printf("\033[31m[Events] Kafka buffer full, dropping events (%d so far) - jobs are unaffected\033[0m", n)
+				} else {
+					log.Printf("\033[31m[Events] Publish failed (%d so far): %v\033[0m", n, err)
+				}
 			}
 			return
 		}

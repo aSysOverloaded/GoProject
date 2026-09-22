@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -13,9 +14,26 @@ import (
 )
 
 type Job struct {
-	ID       string `json:"id"`
-	Payload  string `json:"payload"`
-	Attempts int    `json:"attempts"`
+	ID        string `json:"id"`
+	Payload   string `json:"payload"`
+	Attempts  int    `json:"attempts"`
+	EnqueueID string `json:"enqueue_id,omitempty"`
+}
+
+// newJob builds the i-th job of a batch.
+//
+// EnqueueID is what makes this safe to call twice for the same i. The
+// consumer uses a job's serialised bytes as its identity in Redis, so without
+// it, re-running the producer while an earlier batch was still in flight put
+// byte-identical copies of "job-48" into the in-flight list - and they shared
+// a single deadline entry. crypto/rand.Text gives 128 random bits.
+func newJob(i int) Job {
+	return Job{
+		ID:        fmt.Sprintf("job-%d", i),
+		Payload:   fmt.Sprintf("Payload info for task %d", i),
+		Attempts:  0,
+		EnqueueID: rand.Text(),
+	}
 }
 
 func main() {
@@ -57,11 +75,7 @@ func main() {
 
 	log.Printf("\033[1;32m[Producer] Enqueueing %d persistent jobs into Redis list '%s'...\033[0m", numJobs, queueKey)
 	for i := 1; i <= numJobs; i++ {
-		job := Job{
-			ID:       fmt.Sprintf("job-%d", i),
-			Payload:  fmt.Sprintf("Payload info for task %d", i),
-			Attempts: 0,
-		}
+		job := newJob(i)
 
 		jobJSON, err := json.Marshal(job)
 		if err != nil {

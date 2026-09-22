@@ -656,6 +656,7 @@ func TestMetricsEndpointServesRegistry(t *testing.T) {
 		"jobqueue_jobs_promoted_total",
 		"jobqueue_retry_delay_seconds_bucket",
 		"jobqueue_forced_shutdowns_total",
+		"jobqueue_deadlines_reaped_total",
 		`jobqueue_depth{structure="delayed"}`,
 		`jobqueue_depth{structure="poison"}`,
 		`jobqueue_jobs_dlq_total{reason="permanent"`,

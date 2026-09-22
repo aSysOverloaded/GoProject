@@ -30,9 +30,18 @@ reintroduces the race the heartbeat was added to fix.
 ## Deploy
 
 ```bash
-# 1. Build the image. With Docker Desktop's Kubernetes the cluster shares
-#    the local daemon, so no registry and no push is needed.
-docker build -t jobqueue:dev .
+# 1. Build the image with a UNIQUE tag, and point the workloads at it.
+#
+#    Do not rely on re-tagging :dev. Docker Desktop's Kubernetes node keeps
+#    its own image store: the first time a pod needs jobqueue:dev it copies
+#    that image in, and a later `docker build -t jobqueue:dev` on the host
+#    does NOT replace it. With imagePullPolicy IfNotPresent the node keeps
+#    running the old code, silently. A tag that has never existed before
+#    always gets copied fresh - which is why production tags by git SHA.
+TAG=$(git rev-parse --short HEAD)
+docker build -t jobqueue:$TAG .
+kubectl -n jobqueue set image deployment/jobqueue-consumer consumer=jobqueue:$TAG
+kubectl -n jobqueue set image deployment/jobqueue-auditor  auditor=jobqueue:$TAG
 
 # 2. Apply everything
 kubectl apply -k k8s/
@@ -40,9 +49,9 @@ kubectl apply -k k8s/
 # 3. Watch it come up
 kubectl -n jobqueue get pods -w
 
-# 4. Enqueue a batch
+# 4. Enqueue a batch (same unique tag, for the same reason as step 1)
 kubectl -n jobqueue delete job jobqueue-producer --ignore-not-found
-kubectl apply -f k8s/04-producer-job.yaml
+sed "s#image: jobqueue:dev#image: jobqueue:$TAG#" k8s/04-producer-job.yaml | kubectl apply -f -
 
 # 5. Watch it work
 kubectl -n jobqueue logs -l app.kubernetes.io/name=jobqueue-consumer -f --tail=50
@@ -60,20 +69,32 @@ kubectl -n jobqueue exec -it postgres-0 -- \
 
 ## Things worth demonstrating
 
-**Pod eviction is the real version of your crash test.**
+**A graceful eviction drains; a real crash is recovered.** Two different
+things, and they need two different commands.
+
+`kubectl delete pod --force --grace-period=0` is **not** a crash. It removes
+the Pod object immediately, but the kubelet still delivers SIGTERM, and the
+consumer drains: in-flight jobs finish and settle. Nothing is orphaned and
+`jobs_recovered_total` does not move. That is the graceful path working.
+
+A real crash needs a real SIGKILL - what the kernel's OOM-killer delivers,
+with no chance to drain. On Docker Desktop the node is itself a container, so
+kill the process from inside it:
 
 ```bash
-kubectl -n jobqueue delete pod -l app.kubernetes.io/name=jobqueue-consumer --force --grace-period=0
+# wait until jobs are genuinely in flight first, or there is nothing to recover
+CID=$(docker exec desktop-control-plane crictl ps --name consumer -q | head -1)
+PID=$(docker exec desktop-control-plane crictl inspect -o go-template --template '{{.info.pid}}' "$CID")
+docker exec desktop-control-plane kill -9 "$PID"
 ```
 
-`--grace-period=0` skips SIGTERM entirely, so the pod dies mid-job with no
-chance to drain. The surviving consumer's sweeper reclaims the orphans after
-the visibility timeout. Watch `jobqueue_jobs_recovered_total` move and
+Kubernetes restarts the container, and a sweeper reclaims the dead process's
+jobs exactly one visibility timeout (15s) later. Watch
+`jobqueue_jobs_recovered_total` move and
 `jobqueue_stale_results_discarded_total` stay at zero.
 
-Then contrast with a **graceful** delete (no flags): SIGTERM, clean drain,
-`jobs_recovered_total` does not move at all. Those two commands are the whole
-reliability story in about thirty seconds.
+Measured: 3 jobs in flight at the kill, reclaimed 15s later, completed on the
+other pod - 99 succeeded + 1 buried = 100, no job succeeded twice.
 
 **A rolling restart should recover nothing:**
 

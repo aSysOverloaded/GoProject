@@ -76,6 +76,22 @@ var (
 		Help: "Shutdowns that hit the deadline with jobs still running.",
 	})
 
+	// deadlinesReaped counts deadline entries removed because no job in the
+	// in-flight list referenced them. There are two sources, and they look
+	// different on a graph:
+	//
+	//  - A benign race, producing an occasional single orphan. settle releases
+	//    a job in two commands (ZREM the deadline, then LREM the list entry).
+	//    A sweeper snapshot landing between them sees an in-flight job with no
+	//    deadline and adopts it, recreating a deadline for a finished job.
+	//  - Identical payloads in flight at once, from a producer that does not
+	//    set enqueue_id. This produces a steady stream, and also loses jobs
+	//    through ZSET de-duplication - so sustained growth needs attention.
+	deadlinesReaped = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "jobqueue_deadlines_reaped_total",
+		Help: "Orphaned deadline entries removed by the sweeper. Occasional single increments are a benign race; sustained growth means a producer is enqueueing identical payloads.",
+	})
+
 	// kafkaPublished counts lifecycle events written to the event stream.
 	kafkaPublished = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "jobqueue_events_published_total",
