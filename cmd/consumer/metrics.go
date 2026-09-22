@@ -89,6 +89,14 @@ var (
 		Help: "Orphaned deadline entries removed by the sweeper. Expected to stay at zero; non-zero means a producer is enqueueing identical payloads without an enqueue_id.",
 	})
 
+	// jobsHandedBack counts jobs a shutting-down worker received but returned
+	// to the queue unrun. Movement during rollouts is expected: it is the
+	// drain working correctly.
+	jobsHandedBack = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "jobqueue_jobs_handed_back_total",
+		Help: "Jobs a shutting-down worker received and returned to the queue without running.",
+	})
+
 	// kafkaPublished counts lifecycle events written to the event stream.
 	kafkaPublished = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "jobqueue_events_published_total",

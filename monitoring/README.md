@@ -49,6 +49,7 @@ queries or the dashboard.
 | `jobqueue_jobs_poisoned_total` | counter | Payloads that could not be parsed, moved to `jobs:poison` |
 | `jobqueue_jobs_promoted_total` | counter | Retries moved back onto the queue once their backoff elapsed |
 | `jobqueue_forced_shutdowns_total` | counter | Shutdowns that hit the deadline with jobs still running; usually a handler ignoring its context |
+| `jobqueue_jobs_handed_back_total` | counter | Jobs a shutting-down worker received and returned to the queue unrun. Movement during rollouts is expected: it means the drain is working |
 | `jobqueue_job_duration_seconds` | histogram | Execution time, for percentiles |
 | `jobqueue_retry_delay_seconds` | histogram | Backoff applied before each retry, to confirm it is actually backing off |
 | `jobqueue_depth{structure}` | gauge | Sampled size of `pending`, `inflight`, `delayed`, `dlq`, `poison` and `claimed` (the deadlines ZSET). A sample, not a live value: wait on the counters above when you need to know a job has finished |

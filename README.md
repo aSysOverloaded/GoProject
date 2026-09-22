@@ -57,7 +57,7 @@ publishing disabled. For Kubernetes see [k8s/README.md](k8s/README.md); for
 the metrics see [monitoring/README.md](monitoring/README.md).
 
 ```bash
-go test ./...                                         # 37 tests, no services needed (uses miniredis)
+go test ./...                                         # 38 tests, no services needed (uses miniredis)
 REDIS_URL=redis://localhost:6379/0 bash scripts/smoke-test.sh   # the real binaries against a real, empty Redis
 ```
 
@@ -412,7 +412,7 @@ after losing the job. Both now fail when the ownership check is removed.
 
 ### 11. A slow dependency at startup killed the process
 
-*Fixed in the commit that adds this section.*
+*Fixed in `e3cb3ad`.*
 
 **What was happening.** The consumer checked Redis with a single `PING` and a
 3-second timeout, and exited if it failed. The auditor did the same with
@@ -460,6 +460,46 @@ single `PING` could stretch past 2 seconds. A test that sometimes passes on
 broken code proves nothing, so the delay is now longer than one attempt can
 cover.
 
+### 12. A pod that was shutting down still took new jobs
+
+*Fixed in the commit that adds this section.*
+
+**What was happening.** During a rollout on Kubernetes, two jobs were taken by
+pods that had already been told to stop, seconds after their replacements came
+up. Both jobs completed, so nothing was lost. Still, a stopping pod should
+take nothing new: that is what draining means.
+
+**Why.** A worker waiting for work sits inside a blocking `BLMOVE` for up to
+15 seconds. Shutdown works by cancelling the worker's context, but cancelling
+a context does not interrupt a blocking read that is already waiting; it only
+stops new commands from starting. So if a job arrived during the drain, the
+read returned it to a worker that was meant to be stopping, and the worker
+ran it.
+
+**How it was confirmed.** A test parks a worker on an empty queue, begins
+shutdown, then pushes a job 200 ms later. On the old code the job was taken
+and run. The timing settled the cause: the read returned when the job
+arrived, not when shutdown began.
+
+**The fix.** After `BLMOVE` returns, the worker checks whether shutdown has
+begun. If it has, it hands the job straight back: a Lua script takes it off
+the in-flight list and puts it at the front of the queue, so it's the next
+job taken. The job never ran, so no attempt is used up. If the process dies
+before handing the job back, the job is still in flight and the sweeper
+recovers it as it would after any crash.
+
+Two alternatives were rejected. Closing the Redis client to break the read
+would also break the Redis calls of workers still finishing their jobs. A
+shorter block timeout only narrows the window, and it costs more Redis
+commands while idle.
+
+**Proof.** The test fails without the check. On the cluster, the original
+scenario was recreated: a rollout with an empty queue, then 100 jobs enqueued
+while the old pods were still draining. One old pod handed back 3 jobs that
+arrived during its drain. Neither old pod started a job after its shutdown
+signal, and 100 of 100 jobs finished. `jobqueue_jobs_handed_back_total`
+counts hand-backs; it moving during a rollout means the drain is working.
+
 ### Every fix is mutation-tested
 
 A passing test proves nothing unless it would fail on broken code. So each fix
@@ -485,6 +525,7 @@ written (see the end of bug 10 for why that matters).
 | Startup retrying instead of giving up on the first attempt | `TestConnectRedisWaitsForRedisThatStartsLate`, `TestRetrySucceedsAfterTransientFailures` |
 | Startup giving up once its budget runs out | `TestRetryGivesUpAtItsDeadline` |
 | Each startup attempt having its own timeout | `TestRetryBoundsEachAttempt` |
+| A stopping worker handing back jobs instead of running them | `TestWorkerStopsTakingJobsOnceShutdownBegins` |
 
 ## Lessons from running it for real
 
@@ -515,10 +556,11 @@ cluster rather than from unit tests, which use an in-process Redis
   requeued twice. It does not prevent it running twice when a worker dies
   after finishing the work but before recording it. Handlers need to be
   idempotent, keyed on the job ID.
-- **A pod that is shutting down can still pick up new jobs.** During a rollout,
-  pods that were stopping took two jobs off the queue seconds after the new
-  pods came up. Both completed, but ideally a stopping pod takes nothing new.
-  The cause has not been confirmed.
+- **An idle worker notices shutdown slowly.** A worker parked on an empty
+  queue sits in `BLMOVE` for up to `BLOCK_TIMEOUT` (15s) before it sees the
+  shutdown signal. It no longer takes new work in that window (bug 12), but a
+  drain can take up to 15 seconds. That fits within `SHUTDOWN_TIMEOUT` (25s),
+  and a shorter block timeout would trade it for more Redis traffic while idle.
 - **Everything stateful is a single node.** One Redis, one Kafka broker (with a
   replication factor of 1), and one Postgres, so each is a single point of
   failure.

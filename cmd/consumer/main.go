@@ -240,7 +240,49 @@ func worker(ctx context.Context, id int, rdb *redis.Client, wg *sync.WaitGroup) 
 			continue
 		}
 
+		if ctx.Err() != nil {
+			// Shutdown began while this worker was parked in BLMOVE. Context
+			// cancellation does not interrupt a blocking read that is already
+			// in progress, so a job that arrived during the drain was handed
+			// to a worker that is supposed to be stopping. Give it back
+			// untouched for a live consumer to take.
+			handBack(rdb, id, jobJSON)
+			continue // the loop head sees ctx.Done and returns
+		}
+
 		handleJob(id, rdb, jobJSON)
+	}
+}
+
+// handBackScript returns a job this worker took but never started, as one
+// atomic step: off the in-flight list (and any deadline the sweeper may have
+// adopted for it), back onto the end of the queue that BLMOVE pops from, so
+// it is the very next job taken. The LREM is the ownership check - if the
+// job is no longer in flight, someone else already has it and nothing moves.
+var handBackScript = redis.NewScript(`
+if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
+  return 0
+end
+redis.call('ZREM', KEYS[2], ARGV[1])
+redis.call('RPUSH', KEYS[3], ARGV[1])
+return 1
+`)
+
+// handBack gives a just-taken job back to the queue unchanged. It was never
+// run, so no attempt is consumed. If this fails, the job is still in the
+// in-flight list and the sweeper recovers it as it would after a crash.
+func handBack(rdb *redis.Client, workerID int, jobJSON string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	n, err := handBackScript.Run(ctx, rdb, []string{inflightKey, deadlinesKey, queueKey}, jobJSON).Int()
+	if err != nil {
+		log.Printf("\033[31m[Worker %d] Could not hand a job back during shutdown; the sweeper will recover it: %v\033[0m", workerID, err)
+		return
+	}
+	if n == 1 {
+		jobsHandedBack.Inc()
+		log.Printf("\033[33m[Worker %d] Shutting down: handed a job that arrived during the drain back to the queue\033[0m", workerID)
 	}
 }
 
