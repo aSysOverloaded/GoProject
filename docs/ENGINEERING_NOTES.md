@@ -469,7 +469,7 @@ test fail.
 
 ## 14. The current-state view could report a stale event
 
-*Fixed in the commit that adds this section.*
+*Fixed in `7e0cae6`.*
 
 **How it was found.** Also from the Java port: a test there reproduced it.
 
