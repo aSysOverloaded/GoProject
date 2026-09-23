@@ -435,6 +435,80 @@ arrived during its drain. Neither old pod started a job after its shutdown
 signal, and 100 of 100 jobs finished. `jobqueue_jobs_handed_back_total`
 counts hand-backs; it moving during a rollout means the drain is working.
 
+## 13. Quarantining a payload was not atomic
+
+*Fixed in `fa7f5c9`.*
+
+**How it was found.** Not by running this system at all. The same queue was
+built a second time in Java, and the port's review flagged that this was the
+one remaining state change made of several Redis commands.
+
+**What was happening.** `quarantine()` pushed an unparseable payload to the
+poison list, then removed it from the in-flight list, then removed any
+deadline. A crash between the first and second commands left the payload in
+the poison list **and** still in flight, so the sweeper reclaimed it and
+quarantined it again: a duplicate poison entry.
+
+The push came first deliberately, so that a failure could not lose the
+payload. That reasoning was sound about loss, and wrong about crashes.
+
+**The fix.** One Lua script, with the `LREM` as the ownership check, the same
+shape as the release and hand-back scripts. Either the whole move happens or
+none of it does, and if none of it does the payload stays in flight for the
+sweeper, so the original no-loss property is kept.
+
+**Why it was worth fixing at all.** No job could ever be lost this way, and the
+window needs a crash between two commands. But the README states that every
+state change is a single atomic Redis operation, and this was the one place
+that was not. A claim that is nearly true is worse than one that is qualified.
+
+**Proof.** Quarantining the same payload twice is the same situation without
+needing a crash. The old code produced two poison entries and counted two; the
+new code produces one and counts one. Removing the ownership check makes the
+test fail.
+
+## 14. The current-state view could report a stale event
+
+*Fixed in the commit that adds this section.*
+
+**How it was found.** Also from the Java port: a test there reproduced it.
+
+**What was happening.** `job_current_state` picked each job's latest event by
+`ORDER BY occurred_at DESC`. That timestamp is stamped by whichever *process*
+published the event — and a job's events routinely come from different
+processes. The worker publishes `failed`; the sweeper publishes `recovered`
+and `buried`. On Kubernetes those are different pods, with different clocks. A
+few milliseconds of skew is enough for the view to report a stale event as the
+current one.
+
+**Scope.** This is a reporting bug, not a queue bug. The `job_events` table
+itself was always complete and correctly ordered, so every measurement taken
+from it stands.
+
+**The fix.** Order by `kafka_offset` instead. Offsets are authoritative here
+for a specific reason worth stating: records are keyed by job ID, so all of
+one job's events land in a single partition, and within a partition offsets
+increase in the order the broker accepted them. Across partitions they are not
+comparable, so the keying is what makes this sound. `occurred_at` stays as the
+tie-break for rows written without Kafka coordinates.
+
+This orders events by when Kafka accepted them, which is the best available
+total order — it is not a clock, and does not claim to be.
+
+**No migration tool needed.** `schema.sql` uses `CREATE OR REPLACE VIEW` and
+the auditor applies the whole file at startup, so existing databases pick the
+fix up on the next restart.
+
+**Proof.** A test against a real Postgres inserts `failed` at offset 10 with a
+*later* timestamp and `buried` at offset 11 with an *earlier* one, exactly the
+skew described. The old view answers `failed`; the new one answers `buried`. A
+second test covers rows with no Kafka coordinates, which must still fall back
+to timestamps rather than vanish from the view.
+
+The test needs a real database, so it skips when `DATABASE_URL` is unset and CI
+now runs a Postgres service for it. **That skipping is how the wrong `ORDER BY`
+survived in the first place: there was no test touching this SQL at all.**
+
 ## Every fix is mutation-tested
 
 A passing test proves nothing unless it would fail on broken code. So each fix
@@ -461,6 +535,8 @@ written (see the end of bug 10 for why that matters).
 | Startup giving up once its budget runs out | `TestRetryGivesUpAtItsDeadline` |
 | Each startup attempt having its own timeout | `TestRetryBoundsEachAttempt` |
 | A stopping worker handing back jobs instead of running them | `TestWorkerStopsTakingJobsOnceShutdownBegins` |
+| Quarantine claiming a payload before copying it | `TestQuarantineClaimsThePayloadBeforeCopyingIt` |
+| The current-state view ordering by event order, not clocks | `TestJobCurrentStateUsesEventOrderNotClocks` |
 
 ## Lessons from running it for real
 

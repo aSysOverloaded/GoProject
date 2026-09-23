@@ -227,7 +227,18 @@ REDIS_URL=redis://localhost:6379/0 bash scripts/smoke-test.sh  # end to end, aga
 
 The unit tests use an in-process Redis (miniredis), so they need nothing
 running. The smoke test runs the real consumer and producer against a real
-Redis and checks that all 100 jobs finish exactly once. CI runs both.
+Redis and checks that all 100 jobs finish exactly once.
+
+The audit schema is SQL, so it is tested against a real Postgres. Those tests
+skip unless `DATABASE_URL` is set; they create and drop their own schema, so
+they never touch existing data:
+
+```bash
+DATABASE_URL=postgres://postgres:postgres@localhost:5433/jobqueue?sslmode=disable \
+  go test ./cmd/auditor/
+```
+
+CI runs all three.
 
 ## Limitations
 

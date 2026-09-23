@@ -49,6 +49,19 @@ CREATE INDEX IF NOT EXISTS job_events_type_idx
 -- Convenience view: the current state of every job, derived from its most
 -- recent event. This is the read model; job_events is the log it is
 -- projected from.
+--
+-- Ordered by Kafka offset, NOT by occurred_at. occurred_at is stamped by
+-- whichever process published the event, and a job's events routinely come
+-- from different processes - the worker publishes "failed", the sweeper
+-- publishes "buried" - which on Kubernetes means different pods with
+-- different clocks. A few milliseconds of skew was enough for this view to
+-- report a stale event as the current one.
+--
+-- Offsets are authoritative here because records are keyed by job ID: all of
+-- one job's events land in a single partition, and within a partition
+-- offsets increase in the order the broker accepted them. (Across partitions
+-- offsets are not comparable, which is why the key matters.) occurred_at
+-- remains the tie-break for rows written without Kafka coordinates.
 CREATE OR REPLACE VIEW job_current_state AS
 SELECT DISTINCT ON (job_id)
     job_id,
@@ -60,4 +73,4 @@ SELECT DISTINCT ON (job_id)
     worker,
     occurred_at
 FROM job_events
-ORDER BY job_id, occurred_at DESC, recorded_at DESC;
+ORDER BY job_id, kafka_offset DESC NULLS LAST, occurred_at DESC, recorded_at DESC;

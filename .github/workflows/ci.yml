@@ -72,6 +72,23 @@ jobs:
           --health-timeout 3s
           --health-retries 5
 
+      # The auditor's view is SQL, so the only way to test it is against a
+      # real Postgres. Without this the test skips, which is how a wrong
+      # ORDER BY survived unnoticed.
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: jobqueue
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -88,3 +105,10 @@ jobs:
         env:
           REDIS_URL: redis://localhost:6379/0
         run: bash scripts/smoke-test.sh
+
+      # Runs the auditor's SQL against a real Postgres. It creates and drops
+      # its own schema, so it never touches anything else in the database.
+      - name: Test the audit schema against real Postgres
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/jobqueue?sslmode=disable
+        run: go test ./cmd/auditor/ -count=1 -v
