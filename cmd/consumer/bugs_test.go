@@ -292,6 +292,38 @@ func TestReclaimOfUnparseablePayloadQuarantinesIt(t *testing.T) {
 	}
 }
 
+// TestQuarantineClaimsThePayloadBeforeCopyingIt covers the last place where a
+// state change was not a single Redis operation. quarantine() pushed the
+// payload to the poison list first and only then removed it from the
+// in-flight list, so a crash in between left it in both: the sweeper
+// reclaimed it and quarantined it a second time, producing a duplicate.
+//
+// Quarantining the same payload twice is the same situation without needing
+// a crash: the second attempt must find nothing left to claim.
+func TestQuarantineClaimsThePayloadBeforeCopyingIt(t *testing.T) {
+	useFastTimings(t)
+	rdb := newTestRedis(t)
+	ctx := context.Background()
+
+	garbage := "{not valid json"
+	rdb.RPush(ctx, inflightKey, garbage)
+
+	before := testutil.ToFloat64(jobsPoisoned)
+
+	quarantine(rdb, garbage) // the worker that took it
+	quarantine(rdb, garbage) // a second attempt, e.g. the sweeper after a crash
+
+	if got := queueContents(t, rdb, poisonKey); len(got) != 1 {
+		t.Errorf("payload quarantined %d times, want 1: %v", len(got), got)
+	}
+	if got := testutil.ToFloat64(jobsPoisoned) - before; got != 1 {
+		t.Errorf("jobs_poisoned moved by %v, want 1", got)
+	}
+	if got := queueContents(t, rdb, inflightKey); len(got) != 0 {
+		t.Errorf("payload left in flight: %v", got)
+	}
+}
+
 // TestPublishNeverBlocksWhenKafkaIsDown covers the more serious half of the
 // Kafka bug. With the broker unreachable, records never complete, so the
 // client's buffer fills and stays full. publish() used the blocking Produce,

@@ -328,6 +328,28 @@ func handleJob(workerID int, rdb *redis.Client, jobJSON string) {
 	settle(workerID, rdb, job, jobJSON, runErr, workDuration)
 }
 
+// quarantineScript moves an unparseable payload out of the in-flight list and
+// into the poison list as one atomic step, with the LREM as the ownership
+// check - the same shape as releaseScript and handBackScript.
+//
+//	KEYS[1] jobs:inflight   KEYS[2] jobs:deadlines   KEYS[3] jobs:poison
+//
+// It used to be three separate commands, with the LPUSH first so that a
+// failure could not lose the payload. That was safe against loss but not
+// against a crash: the payload ended up in the poison list AND still in
+// flight, so the sweeper reclaimed it and quarantined it a second time.
+// Claiming it first fixes that, and the script still cannot lose it - either
+// the whole move happens or none of it does, and if none of it does the
+// payload stays in flight for the sweeper.
+var quarantineScript = redis.NewScript(`
+if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
+  return 0
+end
+redis.call('ZREM', KEYS[2], ARGV[1])
+redis.call('LPUSH', KEYS[3], ARGV[1])
+return 1
+`)
+
 // quarantine moves a payload we cannot parse into the poison list. It used to
 // be deleted outright, which is silent data loss in a project whose entire
 // premise is not losing jobs. It cannot go to the DLQ, because the DLQ is
@@ -336,16 +358,19 @@ func quarantine(rdb *redis.Client, rawPayload string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	if err := rdb.LPush(ctx, poisonKey, rawPayload).Err(); err != nil {
-		// Deliberately do NOT remove it from the in-flight list if we could
-		// not save it: leaving it there means the sweeper retries later,
-		// which is far better than dropping it.
+	n, err := quarantineScript.Run(ctx, rdb,
+		[]string{inflightKey, deadlinesKey, poisonKey}, rawPayload).Int()
+	if err != nil {
+		// Nothing moved. The payload is still in flight, and the sweeper
+		// will deal with it - far better than dropping it.
 		log.Printf("\033[31m[Worker] Failed to quarantine payload, leaving it in flight for the sweeper: %v\033[0m", err)
 		return
 	}
+	if n == 0 {
+		// Someone else claimed it first; it has already been quarantined.
+		return
+	}
 
-	rdb.LRem(ctx, inflightKey, 1, rawPayload)
-	rdb.ZRem(ctx, deadlinesKey, rawPayload)
 	jobsPoisoned.Inc()
 
 	events.publish(JobEvent{
